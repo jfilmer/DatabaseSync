@@ -38,8 +38,7 @@ Thumbs.db
 *.Development.json
 *.Production.json
 *.Local.json
-appsettings.*.json
-!appsettings.json
+appsettings*.json
 
 # Publish output
 publish/
