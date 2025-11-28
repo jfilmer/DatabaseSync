@@ -586,13 +586,13 @@ static string FormatDuration(double seconds)
         var hours = (int)(seconds / 3600);
         var mins = (int)((seconds % 3600) / 60);
         var secs = (int)(seconds % 60);
-        return $"{hours}:{mins:D2}:{secs:D2}.{centiseconds:D2}";
+        return $"{hours}h {mins:D2}m {secs:D2}.{centiseconds:D2}s";
     }
     else if (seconds >= 60)
     {
         var mins = (int)(seconds / 60);
         var secs = (int)(seconds % 60);
-        return $"{mins}:{secs:D2}.{centiseconds:D2}";
+        return $"{mins}m {secs:D2}.{centiseconds:D2}s";
     }
     else
     {

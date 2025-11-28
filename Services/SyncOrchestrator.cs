@@ -757,11 +757,11 @@ CREATE TABLE [{tableName}] (
 
         if (duration.TotalHours >= 1)
         {
-            return $"{(int)duration.TotalHours}:{duration.Minutes:D2}:{duration.Seconds:D2}.{centiseconds:D2}";
+            return $"{(int)duration.TotalHours}h {duration.Minutes:D2}m {duration.Seconds:D2}.{centiseconds:D2}s";
         }
         else if (duration.TotalMinutes >= 1)
         {
-            return $"{(int)duration.TotalMinutes}:{duration.Seconds:D2}.{centiseconds:D2}";
+            return $"{(int)duration.TotalMinutes}m {duration.Seconds:D2}.{centiseconds:D2}s";
         }
         else
         {
