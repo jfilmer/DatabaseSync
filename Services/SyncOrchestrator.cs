@@ -395,7 +395,10 @@ public class SyncOrchestrator
     /// <summary>
     /// Sync all tables in the profile
     /// </summary>
-    public async Task<SyncRunResult> SyncAllAsync(bool forceFullRefresh = false)
+    public async Task<SyncRunResult> SyncAllAsync(
+        bool forceFullRefresh = false,
+        LoadMonitor? loadMonitor = null,
+        LoadThrottlingConfig? loadThrottling = null)
     {
         var runResult = new SyncRunResult
         {
@@ -430,9 +433,22 @@ public class SyncOrchestrator
                 {
                     if (_profile.Options.StopOnError && failedTables.Any())
                     {
-                        _logger.LogWarning("Skipping {Table} due to previous failures", 
+                        _logger.LogWarning("Skipping {Table} due to previous failures",
                             tableConfig.SourceTable);
                         continue;
+                    }
+
+                    // Check load before each table (BeforeTable or Both)
+                    if (loadMonitor != null && loadThrottling != null &&
+                        (loadThrottling.CheckTiming == LoadCheckTiming.BeforeTable ||
+                         loadThrottling.CheckTiming == LoadCheckTiming.Both))
+                    {
+                        await loadMonitor.WaitForLowLoadAsync(
+                            _profile.SourceConnection.ConnectionString,
+                            _sourceDatabaseType,
+                            loadThrottling.MaxCpuPercent,
+                            loadThrottling.CheckIntervalSeconds,
+                            loadThrottling.MaxWaitMinutes);
                     }
 
                     var result = await SyncTableAsync(tableConfig, forceFullRefresh);
@@ -459,11 +475,28 @@ public class SyncOrchestrator
                     }
 
                     var config = tableConfig;
+                    // Capture load monitor/throttling for closure
+                    var monitor = loadMonitor;
+                    var throttling = loadThrottling;
+
                     tasks.Add(Task.Run(async () =>
                     {
                         await semaphore.WaitAsync();
                         try
                         {
+                            // Check load before each table (BeforeTable or Both)
+                            if (monitor != null && throttling != null &&
+                                (throttling.CheckTiming == LoadCheckTiming.BeforeTable ||
+                                 throttling.CheckTiming == LoadCheckTiming.Both))
+                            {
+                                await monitor.WaitForLowLoadAsync(
+                                    _profile.SourceConnection.ConnectionString,
+                                    _sourceDatabaseType,
+                                    throttling.MaxCpuPercent,
+                                    throttling.CheckIntervalSeconds,
+                                    throttling.MaxWaitMinutes);
+                            }
+
                             var result = await SyncTableAsync(config, forceFullRefresh);
                             results.Add(result);
                             LogTableResult(result);

@@ -37,9 +37,71 @@ public class SyncServiceConfig
     public BlackoutWindowConfig? BlackoutWindow { get; set; }
 
     /// <summary>
+    /// Load throttling configuration - pause sync when source server is under heavy load
+    /// </summary>
+    public LoadThrottlingConfig? LoadThrottling { get; set; }
+
+    /// <summary>
     /// Sync profiles - each profile defines a source/target pair with its own schedule
     /// </summary>
     public List<SyncProfile> Profiles { get; set; } = new();
+}
+
+/// <summary>
+/// Configuration for load-based throttling
+/// </summary>
+public class LoadThrottlingConfig
+{
+    /// <summary>
+    /// Enable or disable load throttling
+    /// </summary>
+    public bool Enabled { get; set; } = false;
+
+    /// <summary>
+    /// Maximum CPU percentage before pausing sync (default: 60%)
+    /// </summary>
+    public int MaxCpuPercent { get; set; } = 60;
+
+    /// <summary>
+    /// Maximum active queries before pausing sync (used for PostgreSQL sources)
+    /// </summary>
+    public int MaxActiveQueries { get; set; } = 50;
+
+    /// <summary>
+    /// How often to check server load when waiting (seconds)
+    /// </summary>
+    public int CheckIntervalSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// Maximum time to wait for load to decrease before proceeding anyway (minutes)
+    /// </summary>
+    public int MaxWaitMinutes { get; set; } = 30;
+
+    /// <summary>
+    /// When to check load: BeforeProfile, BeforeTable, or Both
+    /// </summary>
+    public LoadCheckTiming CheckTiming { get; set; } = LoadCheckTiming.BeforeTable;
+}
+
+/// <summary>
+/// When to check server load
+/// </summary>
+public enum LoadCheckTiming
+{
+    /// <summary>
+    /// Check once before starting each profile sync
+    /// </summary>
+    BeforeProfile,
+
+    /// <summary>
+    /// Check before syncing each table (more responsive but more overhead)
+    /// </summary>
+    BeforeTable,
+
+    /// <summary>
+    /// Check both before profile and before each table
+    /// </summary>
+    Both
 }
 
 /// <summary>

@@ -55,6 +55,7 @@ A high-performance, standalone database synchronization service that supports **
 | Blackout window | ✅ Complete | Prevent syncs during maintenance/backup windows |
 | Incremental with lookback | ✅ Complete | Re-sync recent data to catch late-arriving changes |
 | Automatic column filtering | ✅ Complete | Skip source columns not in target table |
+| Load-based throttling | ✅ Complete | Pause sync when source server CPU is high |
 
 ### 🔧 Configuration Model
 
@@ -66,6 +67,13 @@ SyncService
 │   ├── Enabled
 │   ├── StartTime ("HH:mm")
 │   └── EndTime ("HH:mm")
+├── LoadThrottling
+│   ├── Enabled
+│   ├── MaxCpuPercent (default: 60)
+│   ├── MaxActiveQueries (default: 50)
+│   ├── CheckIntervalSeconds (default: 30)
+│   ├── MaxWaitMinutes (default: 30)
+│   └── CheckTiming (BeforeProfile/BeforeTable/Both)
 ├── Profiles[]
 │   ├── ProfileName
 │   ├── Description
@@ -140,6 +148,38 @@ When using `Mode: Incremental`, the sync determines where to start based on seve
 - **After**: First incremental sync only loads rows from the last N hours
 
 **Example**: With `LookbackHours: 72`, a first sync on a 4.2M row table loads only ~70K rows (rows from the last 72 hours) instead of all 4.2M rows - a 98% reduction.
+
+#### Load Throttling Options
+
+Load throttling monitors the source database server and pauses sync operations when the server is under heavy load. This protects production databases from additional sync load during peak usage.
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `Enabled` | `false` | Enable/disable load monitoring |
+| `MaxCpuPercent` | `60` | Pause sync when CPU exceeds this percentage (SQL Server) |
+| `MaxActiveQueries` | `50` | Pause sync when active queries exceed this count (PostgreSQL) |
+| `CheckIntervalSeconds` | `30` | How often to re-check load when paused |
+| `MaxWaitMinutes` | `30` | Maximum time to wait before proceeding anyway |
+| `CheckTiming` | `BeforeTable` | When to check: `BeforeProfile`, `BeforeTable`, or `Both` |
+
+**How it works:**
+- **SQL Server**: Queries `sys.dm_os_ring_buffers` for CPU utilization (requires `VIEW SERVER STATE` permission)
+- **PostgreSQL**: Queries `pg_stat_activity` for active connection count
+
+**Permission handling**: If the sync user lacks `VIEW SERVER STATE` permission on SQL Server, a warning is logged once and sync proceeds normally (load throttling is effectively disabled for that source).
+
+**Example configuration:**
+```json
+{
+  "LoadThrottling": {
+    "Enabled": true,
+    "MaxCpuPercent": 60,
+    "CheckIntervalSeconds": 30,
+    "MaxWaitMinutes": 30,
+    "CheckTiming": "BeforeTable"
+  }
+}
+```
 
 #### Recommended Configurations
 
@@ -412,4 +452,4 @@ sc start DatabaseSync
 
 ---
 
-*Last Updated: Added smart first-sync optimization - uses LookbackHours from current time when no sync history exists*
+*Last Updated: Added load-based throttling to pause sync when source server CPU exceeds threshold*

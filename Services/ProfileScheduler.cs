@@ -19,6 +19,7 @@ public class ProfileScheduler : BackgroundService
     private readonly ILogger<ProfileScheduler> _logger;
     private readonly ILoggerFactory _loggerFactory;
     private readonly ConcurrentDictionary<string, ProfileState> _profileStates = new();
+    private readonly LoadMonitor _loadMonitor;
 
     public ProfileScheduler(
         IServiceProvider services,
@@ -30,6 +31,7 @@ public class ProfileScheduler : BackgroundService
         _config = config;
         _logger = logger;
         _loggerFactory = loggerFactory;
+        _loadMonitor = new LoadMonitor(loggerFactory.CreateLogger<LoadMonitor>());
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -43,6 +45,15 @@ public class ProfileScheduler : BackgroundService
             _logger.LogInformation(
                 "Blackout window enabled: {Window} (no new syncs will start during this time)",
                 _config.BlackoutWindow.GetDescription());
+        }
+
+        // Log load throttling configuration
+        if (_config.LoadThrottling?.Enabled == true)
+        {
+            _logger.LogInformation(
+                "Load throttling enabled: pause sync when source CPU > {MaxCpu}% (check: {Timing})",
+                _config.LoadThrottling.MaxCpuPercent,
+                _config.LoadThrottling.CheckTiming);
         }
 
         // Initialize profile states - maintain order for sequential mode
@@ -177,10 +188,26 @@ public class ProfileScheduler : BackgroundService
         if (state.IsRunning)
             return;
 
+        var profile = state.Profile;
+        var throttling = _config.LoadThrottling;
+
+        // Check load throttling before starting profile (BeforeProfile or Both)
+        if (throttling?.Enabled == true &&
+            (throttling.CheckTiming == LoadCheckTiming.BeforeProfile ||
+             throttling.CheckTiming == LoadCheckTiming.Both))
+        {
+            await _loadMonitor.WaitForLowLoadAsync(
+                profile.SourceConnection.ConnectionString,
+                profile.SourceConnection.DatabaseType,
+                throttling.MaxCpuPercent,
+                throttling.CheckIntervalSeconds,
+                throttling.MaxWaitMinutes,
+                stoppingToken);
+        }
+
         state.IsRunning = true;
         state.CurrentRunStartTime = DateTime.UtcNow;
         state.LastRunTime = state.CurrentRunStartTime;
-        var profile = state.Profile;
 
         try
         {
@@ -189,7 +216,8 @@ public class ProfileScheduler : BackgroundService
             var orchestrator = CreateOrchestrator(profile, state);
 
             await orchestrator.InitializeAsync();
-            var result = await orchestrator.SyncAllAsync();
+            var result = await orchestrator.SyncAllAsync(loadMonitor: throttling?.Enabled == true ? _loadMonitor : null,
+                                                          loadThrottling: throttling);
 
             state.CurrentTables.Clear();
             state.LastRunSuccess = result.FailureCount == 0;
