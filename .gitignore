@@ -1,0 +1,46 @@
+# Build results
+[Bb]in/
+[Oo]bj/
+[Dd]ebug/
+[Rr]elease/
+
+# .NET
+*.dll
+*.exe
+*.pdb
+*.cache
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# NuGet
+*.nupkg
+.nuget/
+packages/
+
+# IDE
+.vs/
+.vscode/
+*.swp
+*~
+.idea/
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment and secrets
+*.Development.json
+*.Production.json
+*.Local.json
+appsettings.*.json
+!appsettings.json
+
+# Publish output
+publish/
+out/
