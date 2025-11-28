@@ -75,11 +75,23 @@ public class SyncHistory
     /// Used for incremental sync resume
     /// </summary>
     public DateTime? MaxSourceTimestamp { get; set; }
-    
+
     /// <summary>
     /// Duration in seconds
     /// </summary>
     public double DurationSeconds { get; set; }
+
+    /// <summary>
+    /// Number of rows that were recently modified (within last 168 hours based on timestamp column)
+    /// Used to identify good candidates for incremental sync
+    /// </summary>
+    public long RecentRowsCount { get; set; }
+
+    /// <summary>
+    /// Total number of rows in the source table at sync time
+    /// Used to calculate Recent % (RecentRowsCount / TotalSourceRows)
+    /// </summary>
+    public long TotalSourceRows { get; set; }
 }
 
 /// <summary>

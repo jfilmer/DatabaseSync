@@ -256,56 +256,164 @@ public class ConnectionConfig
 }
 
 /// <summary>
-/// Schedule configuration - similar to SQL Server Agent job scheduling
+/// Schedule configuration - similar to SQL Server Agent job scheduling.
+/// Supports both legacy single-schedule format and new day-specific schedules.
 /// </summary>
 public class ScheduleConfig
 {
     /// <summary>
     /// Time of day for first run (24-hour format: "HH:mm")
     /// Example: "00:00" for midnight, "14:30" for 2:30 PM
+    /// Used when Schedules array is not specified or empty.
     /// </summary>
     public string StartTime { get; set; } = "00:00";
-    
+
     /// <summary>
     /// Minutes between sync runs
     /// Examples: 15 (every 15 min), 60 (hourly), 1440 (daily)
+    /// Used when Schedules array is not specified or empty.
     /// </summary>
     public int IntervalMinutes { get; set; } = 60;
-    
+
     /// <summary>
     /// Run sync immediately when service starts (before first scheduled time)
     /// </summary>
     public bool RunImmediatelyOnStart { get; set; } = true;
-    
+
     /// <summary>
     /// Enable or disable this profile's automatic schedule
     /// When false, profile can still be triggered manually via API
     /// </summary>
     public bool Enabled { get; set; } = true;
-    
+
     /// <summary>
-    /// Optional: Only run on specific days of week
+    /// Optional: Only run on specific days of week (legacy format)
     /// 0 = Sunday, 1 = Monday, ..., 6 = Saturday
     /// Null or empty means run every day
     /// Example: [1,2,3,4,5] for weekdays only
+    /// Note: If Schedules array is specified, this is ignored.
     /// </summary>
     public List<int>? DaysOfWeek { get; set; }
-    
+
+    /// <summary>
+    /// Day-specific schedules - allows different intervals and modes for different days.
+    /// When specified and not empty, takes precedence over legacy DaysOfWeek, IntervalMinutes, StartTime.
+    /// Example: Run Incremental every 2 hours on weekdays, FullRefresh daily on weekends.
+    /// </summary>
+    public List<DaySchedule>? Schedules { get; set; }
+
+    /// <summary>
+    /// Check if this config uses day-specific schedules
+    /// </summary>
+    public bool HasDaySchedules => Schedules != null && Schedules.Any();
+
+    /// <summary>
+    /// Get the schedule that applies for a given day
+    /// </summary>
+    public DaySchedule? GetScheduleForDay(DayOfWeek day)
+    {
+        if (!HasDaySchedules)
+            return null;
+
+        return Schedules!.FirstOrDefault(s => s.AppliesToDay(day));
+    }
+
+    /// <summary>
+    /// Get whether this schedule should force a full refresh for the given day
+    /// </summary>
+    public bool ShouldForceFullRefresh(DayOfWeek day)
+    {
+        var daySchedule = GetScheduleForDay(day);
+        return daySchedule?.ForceFullRefresh ?? false;
+    }
+
     /// <summary>
     /// Calculate the next run time from a given time
     /// </summary>
     public DateTime GetNextRunTime(DateTime fromTime)
     {
+        if (HasDaySchedules)
+        {
+            return GetNextRunTimeFromDaySchedules(fromTime);
+        }
+
+        return GetNextRunTimeLegacy(fromTime);
+    }
+
+    private DateTime GetNextRunTimeFromDaySchedules(DateTime fromTime)
+    {
+        DateTime? earliestNextRun = null;
+
+        // Check each day schedule
+        foreach (var daySchedule in Schedules!)
+        {
+            var parsedDays = daySchedule.GetParsedDays();
+            if (!parsedDays.Any())
+                continue;
+
+            var parts = (daySchedule.StartTime ?? StartTime).Split(':');
+            var startHour = int.Parse(parts[0]);
+            var startMinute = parts.Length > 1 ? int.Parse(parts[1]) : 0;
+            var interval = daySchedule.IntervalMinutes ?? IntervalMinutes;
+
+            // Check each day in this schedule
+            foreach (var day in parsedDays)
+            {
+                var dayNum = (int)day;
+                // Find the next occurrence of this day
+                var daysUntil = ((dayNum - (int)fromTime.DayOfWeek) + 7) % 7;
+                var targetDate = fromTime.Date.AddDays(daysUntil);
+                var dayStart = targetDate.AddHours(startHour).AddMinutes(startMinute);
+
+                DateTime nextRun;
+
+                if (daysUntil == 0) // Today
+                {
+                    if (dayStart > fromTime)
+                    {
+                        nextRun = dayStart;
+                    }
+                    else
+                    {
+                        var minutesSinceStart = (fromTime - dayStart).TotalMinutes;
+                        var intervalsPassed = (int)Math.Floor(minutesSinceStart / interval);
+                        nextRun = dayStart.AddMinutes((intervalsPassed + 1) * interval);
+
+                        // If next run is tomorrow, skip to next week for this day
+                        if (nextRun.Date != targetDate)
+                        {
+                            targetDate = targetDate.AddDays(7);
+                            nextRun = targetDate.AddHours(startHour).AddMinutes(startMinute);
+                        }
+                    }
+                }
+                else
+                {
+                    nextRun = dayStart;
+                }
+
+                if (earliestNextRun == null || nextRun < earliestNextRun)
+                {
+                    earliestNextRun = nextRun;
+                }
+            }
+        }
+
+        return earliestNextRun ?? GetNextRunTimeLegacy(fromTime);
+    }
+
+    private DateTime GetNextRunTimeLegacy(DateTime fromTime)
+    {
         // Parse start time
         var parts = StartTime.Split(':');
         var startHour = int.Parse(parts[0]);
         var startMinute = parts.Length > 1 ? int.Parse(parts[1]) : 0;
-        
+
         // Get today's start time
         var todayStart = fromTime.Date.AddHours(startHour).AddMinutes(startMinute);
-        
+
         DateTime nextRun;
-        
+
         if (todayStart > fromTime)
         {
             // Start time hasn't occurred yet today
@@ -318,7 +426,7 @@ public class ScheduleConfig
             var intervalsPassed = (int)Math.Floor(minutesSinceStart / IntervalMinutes);
             nextRun = todayStart.AddMinutes((intervalsPassed + 1) * IntervalMinutes);
         }
-        
+
         // Apply day-of-week filter if specified
         if (DaysOfWeek != null && DaysOfWeek.Any())
         {
@@ -327,14 +435,60 @@ public class ScheduleConfig
                 nextRun = nextRun.Date.AddDays(1).AddHours(startHour).AddMinutes(startMinute);
             }
         }
-        
+
         return nextRun;
     }
-    
+
     /// <summary>
     /// Get a human-readable description of the schedule
     /// </summary>
     public string GetDescription(BlackoutWindowConfig? blackoutWindow = null)
+    {
+        if (HasDaySchedules)
+        {
+            return GetDaySchedulesDescription(blackoutWindow);
+        }
+
+        return GetLegacyDescription(blackoutWindow);
+    }
+
+    private string GetDaySchedulesDescription(BlackoutWindowConfig? blackoutWindow)
+    {
+        var parts = new List<string>();
+
+        foreach (var daySchedule in Schedules!)
+        {
+            var interval = (daySchedule.IntervalMinutes ?? IntervalMinutes) switch
+            {
+                1 => "every minute",
+                < 60 => $"every {daySchedule.IntervalMinutes ?? IntervalMinutes} min",
+                60 => "hourly",
+                < 1440 => $"every {(daySchedule.IntervalMinutes ?? IntervalMinutes) / 60}h",
+                1440 => "daily",
+                _ => $"every {(daySchedule.IntervalMinutes ?? IntervalMinutes) / 1440}d"
+            };
+
+            var parsedDays = daySchedule.GetParsedDays();
+            var days = !parsedDays.Any()
+                ? ""
+                : string.Join("/", parsedDays.Select(d => d.ToString().Substring(0, 3)));
+
+            var mode = daySchedule.ForceFullRefresh ? " (Full)" : "";
+
+            parts.Add($"{days}: {interval}{mode}");
+        }
+
+        var description = string.Join(", ", parts);
+
+        if (blackoutWindow?.Enabled == true)
+        {
+            description += $" (blackout {blackoutWindow.StartTime}-{blackoutWindow.EndTime})";
+        }
+
+        return description;
+    }
+
+    private string GetLegacyDescription(BlackoutWindowConfig? blackoutWindow)
     {
         var interval = IntervalMinutes switch
         {
@@ -370,6 +524,94 @@ public class ScheduleConfig
         }
 
         return $"{interval} starting at {effectiveStartTime}{days}{blackoutNote}";
+    }
+}
+
+/// <summary>
+/// Day-specific schedule configuration.
+/// Allows different sync intervals and modes for different days of the week.
+/// </summary>
+public class DaySchedule
+{
+    /// <summary>
+    /// Days of the week this schedule applies to.
+    /// Use day names: "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"
+    /// Also accepts 3-letter abbreviations: "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+    /// Example: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"] for weekdays
+    /// </summary>
+    public List<string>? Days { get; set; }
+
+    /// <summary>
+    /// Minutes between sync runs for these days.
+    /// If not specified, uses the parent ScheduleConfig.IntervalMinutes.
+    /// </summary>
+    public int? IntervalMinutes { get; set; }
+
+    /// <summary>
+    /// Start time for these days (24-hour format: "HH:mm").
+    /// If not specified, uses the parent ScheduleConfig.StartTime.
+    /// </summary>
+    public string? StartTime { get; set; }
+
+    /// <summary>
+    /// Force full refresh mode on these days, overriding table-level Mode settings.
+    /// When true, all tables sync as FullRefresh regardless of their configured Mode.
+    /// </summary>
+    public bool ForceFullRefresh { get; set; } = false;
+
+    /// <summary>
+    /// Parse day name strings to DayOfWeek values
+    /// </summary>
+    public List<DayOfWeek> GetParsedDays()
+    {
+        if (Days == null || !Days.Any())
+            return new List<DayOfWeek>();
+
+        var result = new List<DayOfWeek>();
+        foreach (var day in Days)
+        {
+            if (TryParseDayOfWeek(day, out var dayOfWeek))
+            {
+                result.Add(dayOfWeek);
+            }
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Check if this schedule applies to a specific day
+    /// </summary>
+    public bool AppliesToDay(DayOfWeek day)
+    {
+        return GetParsedDays().Contains(day);
+    }
+
+    private static bool TryParseDayOfWeek(string value, out DayOfWeek dayOfWeek)
+    {
+        dayOfWeek = DayOfWeek.Sunday;
+        if (string.IsNullOrWhiteSpace(value))
+            return false;
+
+        var normalized = value.Trim().ToLowerInvariant();
+
+        // Try full names
+        if (Enum.TryParse<DayOfWeek>(value, ignoreCase: true, out dayOfWeek))
+            return true;
+
+        // Try 3-letter abbreviations
+        dayOfWeek = normalized switch
+        {
+            "sun" => DayOfWeek.Sunday,
+            "mon" => DayOfWeek.Monday,
+            "tue" => DayOfWeek.Tuesday,
+            "wed" => DayOfWeek.Wednesday,
+            "thu" => DayOfWeek.Thursday,
+            "fri" => DayOfWeek.Friday,
+            "sat" => DayOfWeek.Saturday,
+            _ => (DayOfWeek)(-1)
+        };
+
+        return (int)dayOfWeek >= 0;
     }
 }
 

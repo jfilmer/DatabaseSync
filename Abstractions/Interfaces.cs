@@ -31,6 +31,17 @@ public interface ISchemaAnalyzer
     /// Get the maximum value of a timestamp column
     /// </summary>
     Task<DateTime?> GetMaxTimestampAsync(string tableName, string timestampColumn);
+
+    /// <summary>
+    /// Get count of rows where timestamp is within the specified hours from now
+    /// Uses COALESCE with fallback column if provided
+    /// </summary>
+    Task<long> GetRecentRowsCountAsync(
+        string tableName,
+        string timestampColumn,
+        string? fallbackTimestampColumn,
+        int hoursBack,
+        string? sourceFilter = null);
 }
 
 /// <summary>

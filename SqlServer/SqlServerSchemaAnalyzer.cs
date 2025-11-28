@@ -115,7 +115,42 @@ public class SqlServerSchemaAnalyzer : ISchemaAnalyzer
 
         await using var connection = new SqlConnection(_connectionString);
         return await connection.ExecuteScalarAsync<DateTime?>(
-            sql, 
+            sql,
+            commandTimeout: _commandTimeout);
+    }
+
+    public async Task<long> GetRecentRowsCountAsync(
+        string tableName,
+        string timestampColumn,
+        string? fallbackTimestampColumn,
+        int hoursBack,
+        string? sourceFilter = null)
+    {
+        // Build timestamp expression with optional COALESCE for fallback
+        string timestampExpression;
+        if (!string.IsNullOrEmpty(fallbackTimestampColumn))
+        {
+            timestampExpression = $"COALESCE([{timestampColumn}], [{fallbackTimestampColumn}])";
+        }
+        else
+        {
+            timestampExpression = $"[{timestampColumn}]";
+        }
+
+        var cutoffTime = DateTime.UtcNow.AddHours(-hoursBack);
+        var whereClause = $"{timestampExpression} >= @cutoffTime";
+
+        if (!string.IsNullOrEmpty(sourceFilter))
+        {
+            whereClause = $"({sourceFilter}) AND {whereClause}";
+        }
+
+        var sql = $"SELECT COUNT(*) FROM [{tableName}] WHERE {whereClause}";
+
+        await using var connection = new SqlConnection(_connectionString);
+        return await connection.ExecuteScalarAsync<long>(
+            sql,
+            new { cutoffTime },
             commandTimeout: _commandTimeout);
     }
 

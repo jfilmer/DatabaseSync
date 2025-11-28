@@ -25,7 +25,7 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
 
     public async Task InitializeAsync()
     {
-        const string sql = $@"
+        const string createTableSql = $@"
             IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = '{TableName}')
             BEGIN
                 CREATE TABLE [{TableName}] (
@@ -44,6 +44,8 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                     error_message NVARCHAR(MAX),
                     max_source_timestamp DATETIME2,
                     duration_seconds FLOAT NOT NULL,
+                    recent_rows_count BIGINT NOT NULL DEFAULT 0,
+                    total_source_rows BIGINT NOT NULL DEFAULT 0,
                     created_at DATETIME2 DEFAULT GETUTCDATE()
                 );
 
@@ -56,8 +58,31 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
             END
         ";
 
+        // Add columns if they don't exist (for existing tables)
+        const string addRecentRowsColumnSql = $@"
+            IF NOT EXISTS (
+                SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = '{TableName}' AND COLUMN_NAME = 'recent_rows_count'
+            )
+            BEGIN
+                ALTER TABLE [{TableName}] ADD recent_rows_count BIGINT NOT NULL DEFAULT 0;
+            END
+        ";
+
+        const string addTotalSourceRowsColumnSql = $@"
+            IF NOT EXISTS (
+                SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = '{TableName}' AND COLUMN_NAME = 'total_source_rows'
+            )
+            BEGIN
+                ALTER TABLE [{TableName}] ADD total_source_rows BIGINT NOT NULL DEFAULT 0;
+            END
+        ";
+
         await using var connection = new SqlConnection(_connectionString);
-        await connection.ExecuteAsync(sql);
+        await connection.ExecuteAsync(createTableSql);
+        await connection.ExecuteAsync(addRecentRowsColumnSql);
+        await connection.ExecuteAsync(addTotalSourceRowsColumnSql);
 
         _logger.LogDebug("Sync history table initialized");
     }
@@ -69,12 +94,14 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                 run_id, profile_name, source_table, target_table,
                 sync_start_time, sync_end_time, success,
                 rows_processed, rows_inserted, rows_updated, rows_deleted,
-                error_message, max_source_timestamp, duration_seconds
+                error_message, max_source_timestamp, duration_seconds,
+                recent_rows_count, total_source_rows
             ) VALUES (
                 @RunId, @ProfileName, @SourceTable, @TargetTable,
                 @SyncStartTime, @SyncEndTime, @Success,
                 @RowsProcessed, @RowsInserted, @RowsUpdated, @RowsDeleted,
-                @ErrorMessage, @MaxSourceTimestamp, @DurationSeconds
+                @ErrorMessage, @MaxSourceTimestamp, @DurationSeconds,
+                @RecentRowsCount, @TotalSourceRows
             )";
 
         await using var connection = new SqlConnection(_connectionString);
@@ -93,7 +120,9 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
             history.RowsDeleted,
             history.ErrorMessage,
             history.MaxSourceTimestamp,
-            history.DurationSeconds
+            history.DurationSeconds,
+            history.RecentRowsCount,
+            history.TotalSourceRows
         });
 
         _logger.LogDebug(
@@ -151,7 +180,9 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                 rows_deleted AS RowsDeleted,
                 error_message AS ErrorMessage,
                 max_source_timestamp AS MaxSourceTimestamp,
-                duration_seconds AS DurationSeconds
+                duration_seconds AS DurationSeconds,
+                recent_rows_count AS RecentRowsCount,
+                total_source_rows AS TotalSourceRows
             FROM [{TableName}]
             WHERE profile_name = @profileName AND source_table = @sourceTable
             ORDER BY sync_end_time DESC";
@@ -212,7 +243,9 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                 rows_deleted AS RowsDeleted,
                 error_message AS ErrorMessage,
                 max_source_timestamp AS MaxSourceTimestamp,
-                duration_seconds AS DurationSeconds
+                duration_seconds AS DurationSeconds,
+                recent_rows_count AS RecentRowsCount,
+                total_source_rows AS TotalSourceRows
             FROM [{TableName}]
             WHERE profile_name = @profileName
             ORDER BY sync_end_time DESC";

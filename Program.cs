@@ -261,6 +261,7 @@ static string GenerateDashboardHtml(
         .status-success { background: #28a745; color: #fff; }
         .status-failed { background: #dc3545; color: #fff; }
         .status-disabled { background: #6c757d; color: #fff; }
+        .status-pending { background: #17a2b8; color: #fff; }
         .current-tables { background: #1e3a5f; color: #ffc107; padding: 8px 12px; margin: 10px 0; border-radius: 4px; font-size: 0.9em; font-family: monospace; }
         .failed-tables-alert { background: #5a1a1a; border: 1px solid #dc3545; color: #ff6b6b; padding: 12px; margin: 15px 0; border-radius: 6px; font-size: 0.9em; }
         .failed-tables-alert ul { margin: 8px 0 0 0; padding-left: 20px; }
@@ -304,11 +305,15 @@ static string GenerateDashboardHtml(
         var totalDeletes = last24h.Sum(h => h.RowsDeleted);
         var successRate = last24h.Any() ? (last24h.Count(h => h.Success) * 100.0 / last24h.Count) : 0;
 
+        // Determine status - check if profile has ever run (LastRunTime != null)
+        var hasNeverRun = !profile.LastRunTime.HasValue;
         var statusClass = profile.IsRunning ? "status-running" :
                          !profile.ScheduleEnabled ? "status-disabled" :
+                         hasNeverRun ? "status-pending" :
                          profile.LastRunSuccess ? "status-success" : "status-failed";
         var statusText = profile.IsRunning ? "Running" :
                         !profile.ScheduleEnabled ? "Disabled" :
+                        hasNeverRun ? "Pending" :
                         profile.LastRunSuccess ? "Success" : "Failed";
 
         var runningInfoHtml = "";
@@ -359,8 +364,8 @@ static string GenerateDashboardHtml(
                 </div>
             </div>");
 
-        // Show failed tables prominently when last run failed
-        if (!profile.LastRunSuccess && !profile.IsRunning && profile.ScheduleEnabled)
+        // Show failed tables prominently when last run failed (but not if never run)
+        if (!profile.LastRunSuccess && !profile.IsRunning && profile.ScheduleEnabled && !hasNeverRun)
         {
             // Get the most recent run's failed tables from history
             var lastRunId = history.FirstOrDefault()?.RunId;
@@ -415,6 +420,7 @@ static string GenerateDashboardHtml(
                         <th class=""number"">Inserted</th>
                         <th class=""number"">Updated</th>
                         <th class=""number"">Deleted</th>
+                        <th class=""number"">Recent %</th>
                         <th class=""number"">Duration</th>
                     </tr>
                 </thead>
@@ -423,6 +429,10 @@ static string GenerateDashboardHtml(
             foreach (var h in recentHistory)
             {
                 var rowClass = h.Success ? "success" : "failed";
+                // Cap RecentRowsCount at RowsProcessed since we can only count recent rows from what was processed
+                var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsProcessed);
+                var recentPct = h.RowsProcessed > 0 ? (effectiveRecentRows * 100.0 / h.RowsProcessed) : 0;
+                var recentPctStr = h.RowsProcessed > 0 ? $"{recentPct:F1}%" : "-";
                 sb.Append($@"
                     <tr>
                         <td class=""timestamp"">{h.SyncEndTime.ToLocalTime():MM-dd HH:mm}</td>
@@ -432,6 +442,7 @@ static string GenerateDashboardHtml(
                         <td class=""number"">{h.RowsInserted:N0}</td>
                         <td class=""number"">{h.RowsUpdated:N0}</td>
                         <td class=""number"">{h.RowsDeleted:N0}</td>
+                        <td class=""number"">{recentPctStr}</td>
                         <td class=""number"">{FormatDuration(h.DurationSeconds)}</td>
                     </tr>");
             }
@@ -548,6 +559,7 @@ static string GenerateProfileDashboardHtml(
                     <th class=""number"">Inserted</th>
                     <th class=""number"">Updated</th>
                     <th class=""number"">Deleted</th>
+                    <th class=""number"">Recent %</th>
                     <th>Last Sync</th>
                     <th>Status</th>
                 </tr>
@@ -560,6 +572,16 @@ static string GenerateProfileDashboardHtml(
         var lastSync = table.Value.OrderByDescending(h => h.SyncEndTime).FirstOrDefault();
         var statusClass = lastSync?.Success == true ? "success" : "failed";
 
+        // Calculate Recent % - use most recent sync's values for accurate percentage
+        var mostRecentWithData = tableHistory.OrderByDescending(h => h.SyncEndTime)
+            .FirstOrDefault(h => h.RowsProcessed > 0);
+        // Cap RecentRowsCount at RowsProcessed since we can only count recent rows from what was processed
+        var effectiveRecentRows = mostRecentWithData != null
+            ? Math.Min(mostRecentWithData.RecentRowsCount, mostRecentWithData.RowsProcessed) : 0;
+        var recentPercent = mostRecentWithData?.RowsProcessed > 0
+            ? (effectiveRecentRows * 100.0 / mostRecentWithData.RowsProcessed) : 0;
+        var recentPercentStr = mostRecentWithData?.RowsProcessed > 0 ? $"{recentPercent:F1}%" : "-";
+
         sb.Append($@"
                 <tr>
                     <td>{System.Web.HttpUtility.HtmlEncode(table.Key)}</td>
@@ -568,6 +590,7 @@ static string GenerateProfileDashboardHtml(
                     <td class=""number"">{tableHistory.Sum(h => h.RowsInserted):N0}</td>
                     <td class=""number"">{tableHistory.Sum(h => h.RowsUpdated):N0}</td>
                     <td class=""number"">{tableHistory.Sum(h => h.RowsDeleted):N0}</td>
+                    <td class=""number"">{recentPercentStr}</td>
                     <td class=""timestamp"">{lastSync?.SyncEndTime.ToLocalTime():MM-dd HH:mm}</td>
                     <td class=""{statusClass}"">{(lastSync?.Success == true ? "OK" : "FAIL")}</td>
                 </tr>");
@@ -590,6 +613,7 @@ static string GenerateProfileDashboardHtml(
                     <th class=""number"">Inserted</th>
                     <th class=""number"">Updated</th>
                     <th class=""number"">Deleted</th>
+                    <th class=""number"">Recent %</th>
                     <th class=""number"">Duration</th>
                     <th>Error</th>
                 </tr>
@@ -599,6 +623,10 @@ static string GenerateProfileDashboardHtml(
     foreach (var h in history.Take(50))
     {
         var rowClass = h.Success ? "success" : "failed";
+        // Cap RecentRowsCount at RowsProcessed since we can only count recent rows from what was processed
+        var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsProcessed);
+        var recentPercent = h.RowsProcessed > 0 ? (effectiveRecentRows * 100.0 / h.RowsProcessed) : 0;
+        var recentPercentStr = h.RowsProcessed > 0 ? $"{recentPercent:F1}%" : "-";
         sb.Append($@"
                 <tr>
                     <td class=""timestamp"">{h.SyncEndTime.ToLocalTime():MM-dd HH:mm:ss}</td>
@@ -608,6 +636,7 @@ static string GenerateProfileDashboardHtml(
                     <td class=""number"">{h.RowsInserted:N0}</td>
                     <td class=""number"">{h.RowsUpdated:N0}</td>
                     <td class=""number"">{h.RowsDeleted:N0}</td>
+                    <td class=""number"">{recentPercentStr}</td>
                     <td class=""number"">{FormatDuration(h.DurationSeconds)}</td>
                     <td class=""error-msg"" title=""{System.Web.HttpUtility.HtmlAttributeEncode(h.ErrorMessage ?? "")}"">{System.Web.HttpUtility.HtmlEncode(h.ErrorMessage ?? "")}</td>
                 </tr>");

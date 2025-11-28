@@ -209,14 +209,25 @@ public class ProfileScheduler : BackgroundService
         state.CurrentRunStartTime = DateTime.UtcNow;
         state.LastRunTime = state.CurrentRunStartTime;
 
+        // Check if today's schedule forces a full refresh
+        var forceFullRefresh = profile.Schedule.ShouldForceFullRefresh(DateTime.Now.DayOfWeek);
+
         try
         {
-            _logger.LogInformation("═══ Starting scheduled sync for profile '{Name}' ═══", profile.ProfileName);
+            if (forceFullRefresh)
+            {
+                _logger.LogInformation("═══ Starting scheduled FULL REFRESH sync for profile '{Name}' (day schedule) ═══", profile.ProfileName);
+            }
+            else
+            {
+                _logger.LogInformation("═══ Starting scheduled sync for profile '{Name}' ═══", profile.ProfileName);
+            }
 
             var orchestrator = CreateOrchestrator(profile, state);
 
             await orchestrator.InitializeAsync();
-            var result = await orchestrator.SyncAllAsync(loadMonitor: throttling?.Enabled == true ? _loadMonitor : null,
+            var result = await orchestrator.SyncAllAsync(forceFullRefresh,
+                                                          loadMonitor: throttling?.Enabled == true ? _loadMonitor : null,
                                                           loadThrottling: throttling);
 
             state.CurrentTables.Clear();
@@ -426,6 +437,9 @@ public class ProfileScheduler : BackgroundService
                 profile.TargetConnection.ConnectionString,
                 _loggerFactory.CreateLogger<SqlServerSyncHistoryRepository>());
         }
+
+        // Ensure schema is up to date (adds any missing columns)
+        await historyRepo.InitializeAsync();
 
         return await historyRepo.GetRecentHistoryAsync(profile.ProfileName, limit);
     }

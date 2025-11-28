@@ -34,7 +34,13 @@ public class SyncResult
     /// Number of rows deleted from target (if delete detection enabled)
     /// </summary>
     public long RowsDeleted { get; set; }
-    
+
+    /// <summary>
+    /// Number of rows with timestamp within last 168 hours (7 days)
+    /// Used to identify good candidates for incremental sync
+    /// </summary>
+    public long RecentRowsCount { get; set; }
+
     /// <summary>
     /// Time taken to complete the sync
     /// </summary>
@@ -145,4 +151,9 @@ public class BulkCopyResult
     public long RowsInserted { get; set; }
     public long RowsUpdated { get; set; }
     public long RowsDeleted { get; set; }
+
+    /// <summary>
+    /// Number of rows that were recently modified (within last 168 hours based on timestamp column)
+    /// </summary>
+    public long RecentRowsCount { get; set; }
 }

@@ -356,6 +356,7 @@ public class SyncOrchestrator
             result.RowsInserted = copyResult.RowsInserted;
             result.RowsUpdated = copyResult.RowsUpdated;
             result.RowsDeleted = copyResult.RowsDeleted;
+            result.RecentRowsCount = copyResult.RecentRowsCount;
             result.Success = true;
         }
         catch (Exception ex)
@@ -368,6 +369,37 @@ public class SyncOrchestrator
         RecordHistory:
         stopwatch.Stop();
         result.Duration = stopwatch.Elapsed;
+
+        // Calculate recent rows count and total source rows if timestamp column is configured
+        // This counts rows with timestamp within last 168 hours (7 days)
+        long recentRowsCount = 0;
+        long totalSourceRows = 0;
+        if (result.Success && !string.IsNullOrEmpty(tableConfig.TimestampColumn))
+        {
+            try
+            {
+                var sourceTableName = GetEffectiveSourceTableName(tableConfig);
+
+                // Get total source row count (with filter if configured)
+                totalSourceRows = await _sourceAnalyzer.GetRowCountAsync(
+                    sourceTableName,
+                    tableConfig.SourceFilter);
+
+                // Get recent rows count
+                recentRowsCount = await _sourceAnalyzer.GetRecentRowsCountAsync(
+                    sourceTableName,
+                    tableConfig.TimestampColumn,
+                    tableConfig.FallbackTimestampColumn,
+                    hoursBack: 168,
+                    tableConfig.SourceFilter);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to calculate recent rows count for {Table}",
+                    tableConfig.SourceTable);
+            }
+        }
 
         // Record history (always, even for validation failures)
         if (_historyRepository != null)
@@ -387,7 +419,9 @@ public class SyncOrchestrator
                 RowsDeleted = result.RowsDeleted,
                 ErrorMessage = result.Error,
                 MaxSourceTimestamp = maxSourceTimestamp,
-                DurationSeconds = result.Duration.TotalSeconds
+                DurationSeconds = result.Duration.TotalSeconds,
+                RecentRowsCount = recentRowsCount,
+                TotalSourceRows = totalSourceRows
             });
         }
 

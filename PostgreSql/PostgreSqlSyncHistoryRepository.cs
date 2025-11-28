@@ -25,7 +25,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
 
     public async Task InitializeAsync()
     {
-        const string sql = $@"
+        const string createTableSql = $@"
             CREATE TABLE IF NOT EXISTS ""{TableName}"" (
                 id BIGSERIAL PRIMARY KEY,
                 run_id UUID NOT NULL,
@@ -42,20 +42,49 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 error_message TEXT,
                 max_source_timestamp TIMESTAMP,
                 duration_seconds DOUBLE PRECISION NOT NULL,
+                recent_rows_count BIGINT NOT NULL DEFAULT 0,
+                total_source_rows BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT NOW()
             );
 
-            CREATE INDEX IF NOT EXISTS idx_sync_history_profile_table 
+            CREATE INDEX IF NOT EXISTS idx_sync_history_profile_table
                 ON ""{TableName}"" (profile_name, source_table);
-            CREATE INDEX IF NOT EXISTS idx_sync_history_run_id 
+            CREATE INDEX IF NOT EXISTS idx_sync_history_run_id
                 ON ""{TableName}"" (run_id);
-            CREATE INDEX IF NOT EXISTS idx_sync_history_sync_time 
+            CREATE INDEX IF NOT EXISTS idx_sync_history_sync_time
                 ON ""{TableName}"" (sync_end_time DESC);
         ";
 
+        // Add columns if they don't exist (for existing tables)
+        const string addRecentRowsColumnSql = $@"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = '{TableName}' AND column_name = 'recent_rows_count'
+                ) THEN
+                    ALTER TABLE ""{TableName}"" ADD COLUMN recent_rows_count BIGINT NOT NULL DEFAULT 0;
+                END IF;
+            END $$;
+        ";
+
+        const string addTotalSourceRowsColumnSql = $@"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = '{TableName}' AND column_name = 'total_source_rows'
+                ) THEN
+                    ALTER TABLE ""{TableName}"" ADD COLUMN total_source_rows BIGINT NOT NULL DEFAULT 0;
+                END IF;
+            END $$;
+        ";
+
         await using var connection = new NpgsqlConnection(_connectionString);
-        await connection.ExecuteAsync(sql);
-        
+        await connection.ExecuteAsync(createTableSql);
+        await connection.ExecuteAsync(addRecentRowsColumnSql);
+        await connection.ExecuteAsync(addTotalSourceRowsColumnSql);
+
         _logger.LogDebug("Sync history table initialized");
     }
 
@@ -63,15 +92,17 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
     {
         const string sql = $@"
             INSERT INTO ""{TableName}"" (
-                run_id, profile_name, source_table, target_table, 
+                run_id, profile_name, source_table, target_table,
                 sync_start_time, sync_end_time, success,
                 rows_processed, rows_inserted, rows_updated, rows_deleted,
-                error_message, max_source_timestamp, duration_seconds
+                error_message, max_source_timestamp, duration_seconds,
+                recent_rows_count, total_source_rows
             ) VALUES (
                 @RunId, @ProfileName, @SourceTable, @TargetTable,
                 @SyncStartTime, @SyncEndTime, @Success,
                 @RowsProcessed, @RowsInserted, @RowsUpdated, @RowsDeleted,
-                @ErrorMessage, @MaxSourceTimestamp, @DurationSeconds
+                @ErrorMessage, @MaxSourceTimestamp, @DurationSeconds,
+                @RecentRowsCount, @TotalSourceRows
             )";
 
         await using var connection = new NpgsqlConnection(_connectionString);
@@ -90,7 +121,9 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
             history.RowsDeleted,
             history.ErrorMessage,
             history.MaxSourceTimestamp,
-            history.DurationSeconds
+            history.DurationSeconds,
+            history.RecentRowsCount,
+            history.TotalSourceRows
         });
 
         _logger.LogDebug(
@@ -135,7 +168,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
     public async Task<List<SyncHistory>> GetSyncHistoryAsync(string profileName, string sourceTable, int limit = 10)
     {
         const string sql = $@"
-            SELECT 
+            SELECT
                 id AS Id,
                 run_id AS RunId,
                 profile_name AS ProfileName,
@@ -150,7 +183,9 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 rows_deleted AS RowsDeleted,
                 error_message AS ErrorMessage,
                 max_source_timestamp AS MaxSourceTimestamp,
-                duration_seconds AS DurationSeconds
+                duration_seconds AS DurationSeconds,
+                recent_rows_count AS RecentRowsCount,
+                total_source_rows AS TotalSourceRows
             FROM ""{TableName}""
             WHERE profile_name = @profileName AND source_table = @sourceTable
             ORDER BY sync_end_time DESC
@@ -158,7 +193,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
 
         await using var connection = new NpgsqlConnection(_connectionString);
         var results = await connection.QueryAsync<SyncHistory>(
-            sql, 
+            sql,
             new { profileName, sourceTable, limit });
         return results.ToList();
     }
@@ -201,7 +236,9 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 rows_deleted AS RowsDeleted,
                 error_message AS ErrorMessage,
                 max_source_timestamp AS MaxSourceTimestamp,
-                duration_seconds AS DurationSeconds
+                duration_seconds AS DurationSeconds,
+                recent_rows_count AS RecentRowsCount,
+                total_source_rows AS TotalSourceRows
             FROM ""{TableName}""
             WHERE profile_name = @profileName
             ORDER BY sync_end_time DESC
