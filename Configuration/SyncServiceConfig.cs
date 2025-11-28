@@ -467,7 +467,15 @@ public class TableConfig
     /// When enabled, rows that don't exist in source will be deleted from target
     /// </summary>
     public DeleteMode DeleteMode { get; set; } = DeleteMode.None;
-    
+
+    /// <summary>
+    /// For Incremental sync with DeleteMode.Sync: perform full PK comparison to catch all deletes.
+    /// When true: Compares ALL source PKs vs ALL target PKs (slower but catches all deletes)
+    /// When false: Only deletes are based on the incremental sync window (may miss deletes)
+    /// Default is false. For FullRefresh mode, this setting is ignored (always does full comparison).
+    /// </summary>
+    public bool SyncAllDeletes { get; set; } = false;
+
     /// <summary>
     /// Sync priority - lower numbers sync first
     /// Tables with same priority may sync in parallel

@@ -100,6 +100,7 @@ SyncService
 │       ├── LookbackHours
 │       ├── Priority
 │       ├── DeleteMode (None/Sync)
+│       ├── SyncAllDeletes
 │       ├── CreateIfMissing
 │       └── SourceFilter
 ```
@@ -127,6 +128,7 @@ SyncService
 | `LookbackHours` | `0` | Re-sync rows from (lastSyncTime - hours) | Catch late-arriving changes or retroactive updates. Works with any `TimestampColumn` |
 | `DeleteMode: None` | default | Never delete rows from target | Append-only tables, when you want to preserve target data |
 | `DeleteMode: Sync` | - | Delete rows from target not in source | When target must exactly mirror source |
+| `SyncAllDeletes` | `false` | Full PK comparison for deletes in Incremental mode | Set `true` when using Incremental + DeleteMode.Sync to catch all deletes |
 | `CreateIfMissing` | `false` | Auto-create target table | Initial setup, migrations. Don't use in prod without review |
 | `Priority` | `100` | Sync order (lower = first) | Use when tables have FK dependencies. Same priority = parallel |
 | `SourceFilter` | - | WHERE clause to filter source data | When you only want to sync a subset of rows |

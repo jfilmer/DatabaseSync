@@ -251,11 +251,22 @@ public class SqlServerBulkDataCopier
             result.RowsInserted = mergeResult.Inserted;
             result.RowsUpdated = mergeResult.Updated;
 
-            // Handle synchronized deletes using staging table
+            // Handle synchronized deletes
             if (config.DeleteMode == DeleteMode.Sync)
             {
-                result.RowsDeleted = await SyncDeletesUsingStagingAsync(
-                    targetConn, stagingTableName, targetTableName, pkColumns);
+                if (config.SyncAllDeletes)
+                {
+                    // Full PK comparison - catches all deletes but slower
+                    result.RowsDeleted = await SyncDeletesFullComparisonAsync(
+                        sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter);
+                }
+                else
+                {
+                    // Staging table comparison - faster but only catches deletes in sync window
+                    // NOTE: This may miss deletes for incremental syncs!
+                    result.RowsDeleted = await SyncDeletesUsingStagingAsync(
+                        targetConn, stagingTableName, targetTableName, pkColumns);
+                }
             }
         }
         finally
@@ -544,6 +555,90 @@ public class SqlServerBulkDataCopier
 
         var rowsDeleted = await conn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
         return rowsDeleted;
+    }
+
+    /// <summary>
+    /// Sync deletes using full PK comparison - compares ALL source PKs vs ALL target PKs.
+    /// Slower but catches all deletes, including those outside the incremental sync window.
+    /// </summary>
+    private async Task<long> SyncDeletesFullComparisonAsync(
+        SqlConnection sourceConn,
+        SqlConnection targetConn,
+        string sourceTableName,
+        string targetTableName,
+        List<ColumnInfo> pkColumns,
+        string? sourceFilter)
+    {
+        _logger.LogInformation("Syncing deletes: performing full PK comparison...");
+
+        var pkColumnList = string.Join(", ", pkColumns.Select(c => $"[{c.ColumnName}]"));
+
+        // Get all PKs from source
+        var sourceQuery = $"SELECT {pkColumnList} FROM [{sourceTableName}]";
+        if (!string.IsNullOrEmpty(sourceFilter))
+        {
+            sourceQuery += $" WHERE {sourceFilter}";
+        }
+
+        var sourcePks = (await sourceConn.QueryAsync(sourceQuery, commandTimeout: _commandTimeout)).ToList();
+        _logger.LogDebug("Found {Count:N0} rows in source", sourcePks.Count);
+
+        // Get all PKs from target
+        var targetQuery = $"SELECT {pkColumnList} FROM [{targetTableName}]";
+        var targetPks = (await targetConn.QueryAsync(targetQuery, commandTimeout: _commandTimeout)).ToList();
+        _logger.LogDebug("Found {Count:N0} rows in target", targetPks.Count);
+
+        // Convert to comparable sets
+        var sourcePkSet = new HashSet<string>(
+            sourcePks.Select(row => GetPkKey((object)row, pkColumns)));
+        var targetPkSet = targetPks
+            .Select(row => (Key: GetPkKey((object)row, pkColumns), Row: (object)row))
+            .ToList();
+
+        // Find PKs to delete (in target but not in source)
+        var pksToDelete = targetPkSet.Where(t => !sourcePkSet.Contains(t.Key)).ToList();
+
+        if (!pksToDelete.Any())
+        {
+            _logger.LogDebug("No rows to delete");
+            return 0;
+        }
+
+        _logger.LogInformation("Deleting {Count:N0} rows from target", pksToDelete.Count);
+
+        // Delete in batches
+        const int batchSize = 1000;
+        long totalDeleted = 0;
+
+        for (int i = 0; i < pksToDelete.Count; i += batchSize)
+        {
+            var batch = pksToDelete.Skip(i).Take(batchSize).ToList();
+            var whereConditions = batch.Select(pk =>
+            {
+                var conditions = pkColumns.Select(col =>
+                {
+                    var value = ((IDictionary<string, object>)pk.Row)[col.ColumnName];
+                    if (value == null) return $"[{col.ColumnName}] IS NULL";
+                    if (value is string s) return $"[{col.ColumnName}] = '{s.Replace("'", "''")}'";
+                    if (value is Guid g) return $"[{col.ColumnName}] = '{g}'";
+                    if (value is DateTime dt) return $"[{col.ColumnName}] = '{dt:yyyy-MM-dd HH:mm:ss.fff}'";
+                    return $"[{col.ColumnName}] = {value}";
+                });
+                return $"({string.Join(" AND ", conditions)})";
+            });
+
+            var deleteSql = $"DELETE FROM [{targetTableName}] WHERE {string.Join(" OR ", whereConditions)}";
+            var deleted = await targetConn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
+            totalDeleted += deleted;
+        }
+
+        return totalDeleted;
+    }
+
+    private static string GetPkKey(object row, List<ColumnInfo> pkColumns)
+    {
+        var dict = (IDictionary<string, object>)row;
+        return string.Join("|", pkColumns.Select(c => dict[c.ColumnName]?.ToString() ?? "NULL"));
     }
 
     private string GetSqlServerTypeDef(ColumnInfo col)

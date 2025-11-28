@@ -210,10 +210,16 @@ public class PostgreSqlToSqlServerBulkCopier
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
-            if (config.DeleteMode == DeleteMode.Sync)
+            // Handle synchronized deletes (full PK comparison)
+            // For incremental sync, only perform deletes if SyncAllDeletes is enabled
+            if (config.DeleteMode == DeleteMode.Sync && config.SyncAllDeletes)
             {
                 result.RowsDeleted = await SyncDeletesAsync(
                     sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter);
+            }
+            else if (config.DeleteMode == DeleteMode.Sync && !config.SyncAllDeletes)
+            {
+                _logger.LogDebug("Skipping delete sync for incremental mode (SyncAllDeletes is false)");
             }
         }
         finally
