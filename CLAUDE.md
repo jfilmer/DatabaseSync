@@ -414,6 +414,8 @@ public async Task<SyncResult> SyncTableAsync(...)
 dotnet run
 ```
 
+The dashboard opens automatically at `http://localhost:5123/dashboard`
+
 ### Trigger Sync via API
 ```bash
 # Trigger specific profile
@@ -452,4 +454,4 @@ sc start DatabaseSync
 
 ---
 
-*Last Updated: Added load-based throttling to pause sync when source server CPU exceeds threshold*
+*Last Updated: Dashboard now shows failed tables prominently when a profile fails; fixed sync history recording for validation failures*
