@@ -262,6 +262,10 @@ static string GenerateDashboardHtml(
         .status-failed { background: #dc3545; color: #fff; }
         .status-disabled { background: #6c757d; color: #fff; }
         .current-tables { background: #1e3a5f; color: #ffc107; padding: 8px 12px; margin: 10px 0; border-radius: 4px; font-size: 0.9em; font-family: monospace; }
+        .failed-tables-alert { background: #5a1a1a; border: 1px solid #dc3545; color: #ff6b6b; padding: 12px; margin: 15px 0; border-radius: 6px; font-size: 0.9em; }
+        .failed-tables-alert ul { margin: 8px 0 0 0; padding-left: 20px; }
+        .failed-tables-alert li { margin: 4px 0; }
+        .failed-tables-alert strong { color: #ff8787; }
         .profile-meta { color: #888; font-size: 0.9em; margin-bottom: 15px; }
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 15px; }
         .stat { background: #0f3460; padding: 12px; border-radius: 6px; text-align: center; }
@@ -354,6 +358,49 @@ static string GenerateDashboardHtml(
                     <div class=""stat-label"">Success Rate</div>
                 </div>
             </div>");
+
+        // Show failed tables prominently when last run failed
+        if (!profile.LastRunSuccess && !profile.IsRunning && profile.ScheduleEnabled)
+        {
+            // Get the most recent run's failed tables from history
+            var lastRunId = history.FirstOrDefault()?.RunId;
+            var failedTables = new List<(string SourceTable, string? ErrorMessage)>();
+
+            if (lastRunId != null)
+            {
+                failedTables = history
+                    .Where(h => h.RunId == lastRunId && !h.Success)
+                    .Select(h => (h.SourceTable, h.ErrorMessage))
+                    .ToList();
+            }
+
+            if (failedTables.Count > 0)
+            {
+                sb.Append($@"
+            <div class=""failed-tables-alert"">
+                <strong>Failed Tables ({failedTables.Count}):</strong>
+                <ul>");
+                foreach (var ft in failedTables)
+                {
+                    var errorPreview = !string.IsNullOrEmpty(ft.ErrorMessage)
+                        ? $" - {(ft.ErrorMessage.Length > 80 ? ft.ErrorMessage.Substring(0, 80) + "..." : ft.ErrorMessage)}"
+                        : "";
+                    sb.Append($@"
+                    <li><strong>{System.Web.HttpUtility.HtmlEncode(ft.SourceTable)}</strong>{System.Web.HttpUtility.HtmlEncode(errorPreview)}</li>");
+                }
+                sb.Append(@"
+                </ul>
+            </div>");
+            }
+            else
+            {
+                // If no failures recorded in history, show the last run message
+                sb.Append($@"
+            <div class=""failed-tables-alert"">
+                <strong>Last Run Failed:</strong> {System.Web.HttpUtility.HtmlEncode(profile.LastRunMessage ?? "Unknown error")}
+            </div>");
+            }
+        }
 
         if (recentHistory.Any())
         {

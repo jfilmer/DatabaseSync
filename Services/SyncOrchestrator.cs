@@ -196,7 +196,8 @@ public class SyncOrchestrator
             {
                 result.Success = false;
                 result.Error = $"Source table '{sourceTableNameForCheck}' not found";
-                return result;
+                _logger.LogError("Sync failed for {Table}: {Error}", tableConfig.SourceTable, result.Error);
+                goto RecordHistory;
             }
 
             // Get source schema
@@ -214,7 +215,8 @@ public class SyncOrchestrator
             {
                 result.Success = false;
                 result.Error = "No primary key found - cannot perform upsert";
-                return result;
+                _logger.LogError("Sync failed for {Table}: {Error}", tableConfig.SourceTable, result.Error);
+                goto RecordHistory;
             }
 
             // Check/create target table
@@ -231,7 +233,8 @@ public class SyncOrchestrator
                 {
                     result.Success = false;
                     result.Error = $"Target table '{targetTableName}' not found";
-                    return result;
+                    _logger.LogError("Sync failed for {Table}: {Error}", tableConfig.SourceTable, result.Error);
+                    goto RecordHistory;
                 }
             }
 
@@ -266,7 +269,8 @@ public class SyncOrchestrator
             {
                 result.Success = false;
                 result.Error = "No primary key columns remain after filtering - cannot perform upsert";
-                return result;
+                _logger.LogError("Sync failed for {Table}: {Error}", tableConfig.SourceTable, result.Error);
+                goto RecordHistory;
             }
 
             // Determine effective mode and last sync time
@@ -361,10 +365,11 @@ public class SyncOrchestrator
             _logger.LogError(ex, "Sync failed for {Table}", tableConfig.SourceTable);
         }
 
+        RecordHistory:
         stopwatch.Stop();
         result.Duration = stopwatch.Elapsed;
 
-        // Record history
+        // Record history (always, even for validation failures)
         if (_historyRepository != null)
         {
             await _historyRepository.RecordSyncAsync(new SyncHistory
