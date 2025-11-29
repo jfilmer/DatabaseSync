@@ -131,7 +131,7 @@ A high-performance, standalone database synchronization service that supports **
             "Mode": "Incremental",
             "TimestampColumn": "LastUpdated",
             "LookbackHours": 24,
-            "DeleteMode": "None"
+            "DeleteMode": "Sync"
           }
         ]
       }
@@ -277,7 +277,7 @@ The `Type` field in connection config accepts:
   "SourceTable": "Orders",
   "Mode": "Incremental",
   "TimestampColumn": "ModifiedDate",
-  "DeleteMode": "None"
+  "DeleteMode": "Sync"
 }
 ```
 
@@ -288,7 +288,7 @@ The `Type` field in connection config accepts:
   "Mode": "Incremental",
   "TimestampColumn": "LastEditDT",
   "LookbackHours": 72,
-  "DeleteMode": "None"
+  "DeleteMode": "Sync"
 }
 ```
 Re-syncs all rows where `LastEditDT` >= (last sync time - 72 hours).
@@ -301,7 +301,7 @@ Re-syncs all rows where `LastEditDT` >= (last sync time - 72 hours).
   "TimestampColumn": "LastEditDT",
   "FallbackTimestampColumn": "EntryDT",
   "LookbackHours": 72,
-  "DeleteMode": "None"
+  "DeleteMode": "Sync"
 }
 ```
 Uses `COALESCE(LastEditDT, EntryDT)` - if `LastEditDT` is NULL, falls back to `EntryDT`.
@@ -426,14 +426,79 @@ Pause sync when source database is under heavy load:
 
 ---
 
-## Delete Mode Behavior
+## Delete Synchronization (DeleteMode and SyncAllDeletes)
+
+Delete synchronization ensures the target table mirrors the source by removing rows that no longer exist in the source. This is controlled by two settings that work together:
+
+### DeleteMode
 
 | Mode | Behavior |
 |------|----------|
 | `None` | Only INSERT and UPDATE - never delete from target |
 | `Sync` | Synchronized deletes - delete rows in target that don't exist in source |
 
-When `DeleteMode: Sync` is enabled, uses an optimized SQL-based approach with `DELETE ... LEFT JOIN` for high performance.
+### SyncAllDeletes
+
+This setting controls **how** deletes are detected when `DeleteMode: Sync` is enabled:
+
+| SyncAllDeletes | Delete Detection Method | Best For |
+|----------------|------------------------|----------|
+| `false` (default) | **Staging Table Comparison** - Only compares PKs from rows in the current sync batch | FullRefresh mode (entire table is in staging) |
+| `true` | **Full PK Comparison** - Compares ALL primary keys between source and target | Incremental mode (catches deletes outside sync window) |
+
+### How Delete Detection Works
+
+**Staging Table Comparison** (`SyncAllDeletes: false`):
+1. After upserting data, compares PKs in staging table vs target table
+2. Deletes rows in target that exist in staging but not in target
+3. Fast, but only detects deletes for rows that were in the sync batch
+4. Works perfectly for FullRefresh since all rows are in the staging table
+
+**Full PK Comparison** (`SyncAllDeletes: true`):
+1. Creates a staging table with ALL primary keys from source
+2. Uses SQL-based `DELETE ... LEFT JOIN` to find and delete orphaned rows
+3. Catches ALL deletes, even rows deleted outside the incremental time window
+4. Uses optimized SQL operations with clustered indexes for performance
+
+### Why This Matters for Incremental Mode
+
+In Incremental mode, only recently-changed rows are synced based on `TimestampColumn`. If a row is deleted from source:
+- The deleted row has no timestamp change (it doesn't exist)
+- Without `SyncAllDeletes: true`, the delete is never detected
+- The orphaned row remains in target indefinitely
+
+**Example**: A row deleted from source 2 weeks ago won't appear in an incremental sync looking at the last 72 hours. Only `SyncAllDeletes: true` will catch it.
+
+### Recommended Configuration
+
+**FullRefresh tables** - Staging comparison is sufficient:
+```json
+{
+  "Mode": "FullRefresh",
+  "DeleteMode": "Sync"
+}
+```
+
+**Incremental tables** - Use full PK comparison to catch all deletes:
+```json
+{
+  "Mode": "Incremental",
+  "TimestampColumn": "LastEditDT",
+  "LookbackHours": 72,
+  "DeleteMode": "Sync",
+  "SyncAllDeletes": true
+}
+```
+
+### Performance Characteristics
+
+The Full PK Comparison uses an optimized SQL-based approach:
+1. Bulk loads all source PKs to a staging table using `SqlBulkCopy`
+2. Creates a clustered index on the staging table
+3. Executes a single `DELETE ... LEFT JOIN` statement
+4. All operations happen on the database server (no client-side PK loading)
+
+**Tested performance**: A table with 70K+ rows completes delete sync in ~7 minutes (previously timed out after 1 hour with the old in-memory approach).
 
 ---
 
@@ -530,4 +595,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added day-specific scheduling with ForceFullRefresh option*
+*Last Updated: Added comprehensive delete synchronization documentation (DeleteMode + SyncAllDeletes)*

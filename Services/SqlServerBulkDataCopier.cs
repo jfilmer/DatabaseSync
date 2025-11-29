@@ -559,7 +559,7 @@ public class SqlServerBulkDataCopier
 
     /// <summary>
     /// Sync deletes using full PK comparison - compares ALL source PKs vs ALL target PKs.
-    /// Slower but catches all deletes, including those outside the incremental sync window.
+    /// Uses SQL-based staging table approach for efficiency with large tables.
     /// </summary>
     private async Task<long> SyncDeletesFullComparisonAsync(
         SqlConnection sourceConn,
@@ -572,73 +572,130 @@ public class SqlServerBulkDataCopier
         _logger.LogInformation("Syncing deletes: performing full PK comparison...");
 
         var pkColumnList = string.Join(", ", pkColumns.Select(c => $"[{c.ColumnName}]"));
+        var sourcePkStagingTable = $"#_source_pks_{Guid.NewGuid():N}"[..40];
 
-        // Get all PKs from source
-        var sourceQuery = $"SELECT {pkColumnList} FROM [{sourceTableName}]";
-        if (!string.IsNullOrEmpty(sourceFilter))
+        try
         {
-            sourceQuery += $" WHERE {sourceFilter}";
-        }
-
-        var sourcePks = (await sourceConn.QueryAsync(sourceQuery, commandTimeout: _commandTimeout)).ToList();
-        _logger.LogDebug("Found {Count:N0} rows in source", sourcePks.Count);
-
-        // Get all PKs from target
-        var targetQuery = $"SELECT {pkColumnList} FROM [{targetTableName}]";
-        var targetPks = (await targetConn.QueryAsync(targetQuery, commandTimeout: _commandTimeout)).ToList();
-        _logger.LogDebug("Found {Count:N0} rows in target", targetPks.Count);
-
-        // Convert to comparable sets
-        var sourcePkSet = new HashSet<string>(
-            sourcePks.Select(row => GetPkKey((object)row, pkColumns)));
-        var targetPkSet = targetPks
-            .Select(row => (Key: GetPkKey((object)row, pkColumns), Row: (object)row))
-            .ToList();
-
-        // Find PKs to delete (in target but not in source)
-        var pksToDelete = targetPkSet.Where(t => !sourcePkSet.Contains(t.Key)).ToList();
-
-        if (!pksToDelete.Any())
-        {
-            _logger.LogDebug("No rows to delete");
-            return 0;
-        }
-
-        _logger.LogInformation("Deleting {Count:N0} rows from target", pksToDelete.Count);
-
-        // Delete in batches
-        const int batchSize = 1000;
-        long totalDeleted = 0;
-
-        for (int i = 0; i < pksToDelete.Count; i += batchSize)
-        {
-            var batch = pksToDelete.Skip(i).Take(batchSize).ToList();
-            var whereConditions = batch.Select(pk =>
+            // Create a staging table on target for source PKs
+            var pkColumnDefs = pkColumns.Select(col =>
             {
-                var conditions = pkColumns.Select(col =>
-                {
-                    var value = ((IDictionary<string, object>)pk.Row)[col.ColumnName];
-                    if (value == null) return $"[{col.ColumnName}] IS NULL";
-                    if (value is string s) return $"[{col.ColumnName}] = '{s.Replace("'", "''")}'";
-                    if (value is Guid g) return $"[{col.ColumnName}] = '{g}'";
-                    if (value is DateTime dt) return $"[{col.ColumnName}] = '{dt:yyyy-MM-dd HH:mm:ss.fff}'";
-                    return $"[{col.ColumnName}] = {value}";
-                });
-                return $"({string.Join(" AND ", conditions)})";
+                var typeDef = GetSqlServerTypeDef(col);
+                return $"[{col.ColumnName}] {typeDef} NOT NULL";
             });
 
-            var deleteSql = $"DELETE FROM [{targetTableName}] WHERE {string.Join(" OR ", whereConditions)}";
-            var deleted = await targetConn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
-            totalDeleted += deleted;
+            var createStagingSql = $@"
+                CREATE TABLE [{sourcePkStagingTable}] (
+                    {string.Join(",\n                    ", pkColumnDefs)}
+                )";
+            await targetConn.ExecuteAsync(createStagingSql, commandTimeout: _commandTimeout);
+
+            // Build source query for PKs
+            var sourceQuery = $"SELECT {pkColumnList} FROM [{sourceTableName}]";
+            if (!string.IsNullOrEmpty(sourceFilter))
+            {
+                sourceQuery += $" WHERE {sourceFilter}";
+            }
+
+            // Stream source PKs to target staging table using bulk copy
+            _logger.LogDebug("Loading source PKs to staging table...");
+            long sourcePkCount = 0;
+
+            await using (var reader = await sourceConn.ExecuteReaderAsync(sourceQuery, commandTimeout: _commandTimeout))
+            {
+                var dataTable = new DataTable();
+                foreach (var col in pkColumns)
+                {
+                    dataTable.Columns.Add(col.ColumnName, GetClrType(col.DataType));
+                }
+
+                while (await reader.ReadAsync())
+                {
+                    var row = dataTable.NewRow();
+                    for (int i = 0; i < pkColumns.Count; i++)
+                    {
+                        var value = reader.GetValue(i);
+                        row[i] = value == DBNull.Value ? DBNull.Value : value;
+                    }
+                    dataTable.Rows.Add(row);
+                    sourcePkCount++;
+
+                    // Batch insert every 100k rows
+                    if (sourcePkCount % 100000 == 0)
+                    {
+                        using var bulkCopy = new SqlBulkCopy(targetConn)
+                        {
+                            DestinationTableName = sourcePkStagingTable,
+                            BatchSize = 10000,
+                            BulkCopyTimeout = _commandTimeout
+                        };
+                        foreach (var col in pkColumns)
+                        {
+                            bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                        }
+                        await bulkCopy.WriteToServerAsync(dataTable);
+                        dataTable.Clear();
+                        _logger.LogDebug("Loaded {Count:N0} source PKs...", sourcePkCount);
+                    }
+                }
+
+                // Insert remaining rows
+                if (dataTable.Rows.Count > 0)
+                {
+                    using var bulkCopy = new SqlBulkCopy(targetConn)
+                    {
+                        DestinationTableName = sourcePkStagingTable,
+                        BatchSize = 10000,
+                        BulkCopyTimeout = _commandTimeout
+                    };
+                    foreach (var col in pkColumns)
+                    {
+                        bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    }
+                    await bulkCopy.WriteToServerAsync(dataTable);
+                }
+            }
+
+            _logger.LogDebug("Loaded {Count:N0} source PKs to staging", sourcePkCount);
+
+            // Create index on staging table for faster join
+            var pkIndexColumns = string.Join(", ", pkColumns.Select(c => $"[{c.ColumnName}]"));
+            var createIndexSql = $"CREATE CLUSTERED INDEX IX_PK ON [{sourcePkStagingTable}] ({pkIndexColumns})";
+            await targetConn.ExecuteAsync(createIndexSql, commandTimeout: _commandTimeout);
+
+            // Count rows to delete
+            var joinCondition = string.Join(" AND ",
+                pkColumns.Select(c => $"t.[{c.ColumnName}] = s.[{c.ColumnName}]"));
+
+            var countSql = $@"
+                SELECT COUNT(*)
+                FROM [{targetTableName}] t
+                LEFT JOIN [{sourcePkStagingTable}] s ON {joinCondition}
+                WHERE s.[{pkColumns[0].ColumnName}] IS NULL";
+
+            var deleteCount = await targetConn.ExecuteScalarAsync<long>(countSql, commandTimeout: _commandTimeout);
+
+            if (deleteCount == 0)
+            {
+                _logger.LogDebug("No rows to delete");
+                return 0;
+            }
+
+            _logger.LogInformation("Deleting {Count:N0} rows from target (not in source)", deleteCount);
+
+            // Delete rows not in source using efficient SQL
+            var deleteSql = $@"
+                DELETE t
+                FROM [{targetTableName}] t
+                LEFT JOIN [{sourcePkStagingTable}] s ON {joinCondition}
+                WHERE s.[{pkColumns[0].ColumnName}] IS NULL";
+
+            var rowsDeleted = await targetConn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
+            return rowsDeleted;
         }
-
-        return totalDeleted;
-    }
-
-    private static string GetPkKey(object row, List<ColumnInfo> pkColumns)
-    {
-        var dict = (IDictionary<string, object>)row;
-        return string.Join("|", pkColumns.Select(c => dict[c.ColumnName]?.ToString() ?? "NULL"));
+        finally
+        {
+            // Staging table is a temp table (#), auto-dropped when connection closes
+        }
     }
 
     private string GetSqlServerTypeDef(ColumnInfo col)
