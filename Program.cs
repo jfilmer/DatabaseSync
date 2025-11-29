@@ -429,10 +429,11 @@ static string GenerateDashboardHtml(
             foreach (var h in recentHistory)
             {
                 var rowClass = h.Success ? "success" : "failed";
-                // Cap RecentRowsCount at RowsProcessed since we can only count recent rows from what was processed
-                var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsProcessed);
-                var recentPct = h.RowsProcessed > 0 ? (effectiveRecentRows * 100.0 / h.RowsProcessed) : 0;
-                var recentPctStr = h.RowsProcessed > 0 ? $"{recentPct:F1}%" : "-";
+                // Calculate Recent % based on RowsUpdated (not RowsProcessed which includes inserts)
+                // This answers: "Of the updates we performed, what % were for recent records?"
+                var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsUpdated);
+                var recentPct = h.RowsUpdated > 0 ? (effectiveRecentRows * 100.0 / h.RowsUpdated) : 0;
+                var recentPctStr = h.RowsUpdated > 0 ? $"{recentPct:F1}%" : "-";
                 sb.Append($@"
                     <tr>
                         <td class=""timestamp"">{h.SyncEndTime.ToLocalTime():MM-dd HH:mm}</td>
@@ -573,14 +574,14 @@ static string GenerateProfileDashboardHtml(
         var statusClass = lastSync?.Success == true ? "success" : "failed";
 
         // Calculate Recent % - use most recent sync's values for accurate percentage
+        // Based on RowsUpdated (not RowsProcessed) to show % of updates that were for recent records
         var mostRecentWithData = tableHistory.OrderByDescending(h => h.SyncEndTime)
-            .FirstOrDefault(h => h.RowsProcessed > 0);
-        // Cap RecentRowsCount at RowsProcessed since we can only count recent rows from what was processed
+            .FirstOrDefault(h => h.RowsUpdated > 0);
         var effectiveRecentRows = mostRecentWithData != null
-            ? Math.Min(mostRecentWithData.RecentRowsCount, mostRecentWithData.RowsProcessed) : 0;
-        var recentPercent = mostRecentWithData?.RowsProcessed > 0
-            ? (effectiveRecentRows * 100.0 / mostRecentWithData.RowsProcessed) : 0;
-        var recentPercentStr = mostRecentWithData?.RowsProcessed > 0 ? $"{recentPercent:F1}%" : "-";
+            ? Math.Min(mostRecentWithData.RecentRowsCount, mostRecentWithData.RowsUpdated) : 0;
+        var recentPercent = mostRecentWithData?.RowsUpdated > 0
+            ? (effectiveRecentRows * 100.0 / mostRecentWithData.RowsUpdated) : 0;
+        var recentPercentStr = mostRecentWithData?.RowsUpdated > 0 ? $"{recentPercent:F1}%" : "-";
 
         sb.Append($@"
                 <tr>
@@ -623,10 +624,11 @@ static string GenerateProfileDashboardHtml(
     foreach (var h in history.Take(50))
     {
         var rowClass = h.Success ? "success" : "failed";
-        // Cap RecentRowsCount at RowsProcessed since we can only count recent rows from what was processed
-        var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsProcessed);
-        var recentPercent = h.RowsProcessed > 0 ? (effectiveRecentRows * 100.0 / h.RowsProcessed) : 0;
-        var recentPercentStr = h.RowsProcessed > 0 ? $"{recentPercent:F1}%" : "-";
+        // Calculate Recent % based on RowsUpdated (not RowsProcessed which includes inserts)
+        // This answers: "Of the updates we performed, what % were for recent records?"
+        var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsUpdated);
+        var recentPercent = h.RowsUpdated > 0 ? (effectiveRecentRows * 100.0 / h.RowsUpdated) : 0;
+        var recentPercentStr = h.RowsUpdated > 0 ? $"{recentPercent:F1}%" : "-";
         sb.Append($@"
                 <tr>
                     <td class=""timestamp"">{h.SyncEndTime.ToLocalTime():MM-dd HH:mm:ss}</td>

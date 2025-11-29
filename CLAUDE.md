@@ -500,6 +500,91 @@ The Full PK Comparison uses an optimized SQL-based approach:
 
 **Tested performance**: A table with 70K+ rows completes delete sync in ~7 minutes (previously timed out after 1 hour with the old in-memory approach).
 
+### Safety Thresholds
+
+The full PK comparison includes built-in safety checks to prevent catastrophic data loss:
+
+1. **Source Ratio Check**: If source has less than 50% of target's row count, the delete is aborted. This catches scenarios where the source database is incomplete (e.g., only incremental data was loaded).
+
+2. **Delete Ratio Check**: If more than 10% of target rows would be deleted, the operation is aborted. This prevents accidental mass deletion due to configuration errors.
+
+When a safety check triggers, an error is logged and 0 rows are deleted. Review the configuration and use FullRefresh mode if a large-scale delete is intentional.
+
+### CRITICAL: Chained Sync Limitation
+
+**DO NOT use `SyncAllDeletes: true` in chained incremental sync scenarios.**
+
+A chained sync is when Profile A syncs to Database B, and Profile B then syncs Database B to Database C:
+```
+Production (34M rows) → [Profile 1] → Staging → [Profile 2] → Downstream
+```
+
+**The Problem**: If Profile 1 uses Incremental mode, Staging only receives the changed rows (e.g., 4K rows). When Profile 2 runs with `SyncAllDeletes: true`, it compares Staging's 4K PKs against Downstream's 34M rows and attempts to delete 34M rows (everything not in the 4K).
+
+**Safe Configurations for Chained Syncs**:
+
+| Profile Position | Recommended Settings |
+|------------------|---------------------|
+| First profile (Production → Staging) | `SyncAllDeletes: true` is safe (source is authoritative) |
+| Downstream profiles (Staging → Other) | Use `SyncAllDeletes: false` or `DeleteMode: None` |
+
+**Example - Safe chained sync for large incremental tables**:
+```json
+// Profile 1: Production → Staging (SyncAllDeletes OK)
+{
+  "SourceTable": "tbl_Track",
+  "Mode": "Incremental",
+  "DeleteMode": "Sync",
+  "SyncAllDeletes": true  // Safe - source is authoritative
+}
+
+// Profile 2: Staging → Downstream (SyncAllDeletes NOT safe)
+{
+  "SourceTable": "tbl_Track",
+  "Mode": "Incremental",
+  "DeleteMode": "Sync",
+  "SyncAllDeletes": false  // Required - staging is not authoritative
+}
+```
+
+---
+
+## Dashboard
+
+The web dashboard at `/dashboard` provides real-time visibility into sync operations.
+
+### Dashboard Columns
+
+| Column | Description |
+|--------|-------------|
+| **Table** | Source table name |
+| **Mode** | Sync mode (Incremental or FullRefresh) |
+| **Status** | Success/Failed indicator |
+| **Rows** | Total rows processed (inserts + updates) |
+| **Ins/Upd/Del** | Breakdown of inserts, updates, and deletes |
+| **Recent %** | Percentage of updates that were for recently-modified records |
+| **Duration** | Time taken for the sync operation |
+| **Completed** | When the sync finished |
+
+### Understanding "Recent %"
+
+The **Recent %** column answers the question: *"Of the updates we performed, what percentage were for records that have been inserted or updated within the last 168 hours (7 days)?"*
+
+**Calculation**: `RecentRowsCount / RowsUpdated * 100`
+
+Where:
+- `RecentRowsCount` = Number of source rows where the timestamp column >= (now - 168 hours)
+- `RowsUpdated` = Number of rows that were updated (not inserted) during this sync
+
+**Why this matters**:
+- A high percentage (e.g., 80-100%) indicates most updates are for recently-changed data, which is expected behavior
+- A low percentage suggests updates are happening to older records, which may indicate:
+  - Retroactive data corrections in the source system
+  - Late-arriving data with backdated timestamps
+  - Need to increase `LookbackHours` to catch these changes
+
+**Note**: This metric only applies to updates. Inserts are excluded because new records are always "recent" by definition. The column shows `-` when there are no updates in the sync.
+
 ---
 
 ## Architecture
@@ -595,4 +680,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added comprehensive delete synchronization documentation (DeleteMode + SyncAllDeletes)*
+*Last Updated: Added dashboard documentation; fixed Recent % calculation to use RowsUpdated instead of RowsProcessed*

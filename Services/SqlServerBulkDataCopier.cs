@@ -257,8 +257,18 @@ public class SqlServerBulkDataCopier
                 if (config.SyncAllDeletes)
                 {
                     // Full PK comparison - catches all deletes but slower
+                    // Pass incremental scope to restrict deletes to rows within sync window
+                    // The timestamp column is required for incremental mode, so it should always be present
                     result.RowsDeleted = await SyncDeletesFullComparisonAsync(
-                        sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter);
+                        sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter,
+                        incrementalScope: !string.IsNullOrEmpty(config.TimestampColumn)
+                            ? new IncrementalDeleteScope
+                            {
+                                TimestampColumn = config.TimestampColumn,
+                                FallbackTimestampColumn = config.FallbackTimestampColumn,
+                                CutoffTime = lastSyncTime
+                            }
+                            : null);
                 }
                 else
                 {
@@ -560,6 +570,8 @@ public class SqlServerBulkDataCopier
     /// <summary>
     /// Sync deletes using full PK comparison - compares ALL source PKs vs ALL target PKs.
     /// Uses SQL-based staging table approach for efficiency with large tables.
+    /// SAFETY: Will abort if more than 10% of target rows would be deleted (likely indicates data issue).
+    /// When incrementalScope is provided, deletes are restricted to rows within the sync window.
     /// </summary>
     private async Task<long> SyncDeletesFullComparisonAsync(
         SqlConnection sourceConn,
@@ -567,15 +579,31 @@ public class SqlServerBulkDataCopier
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> pkColumns,
-        string? sourceFilter)
+        string? sourceFilter,
+        IncrementalDeleteScope? incrementalScope = null)
     {
-        _logger.LogInformation("Syncing deletes: performing full PK comparison...");
+        if (incrementalScope != null)
+        {
+            _logger.LogInformation(
+                "Syncing deletes: performing full PK comparison (scoped to rows with {TimestampColumn} >= {CutoffTime})...",
+                incrementalScope.TimestampColumn,
+                incrementalScope.CutoffTime);
+        }
+        else
+        {
+            _logger.LogInformation("Syncing deletes: performing full PK comparison...");
+        }
 
         var pkColumnList = string.Join(", ", pkColumns.Select(c => $"[{c.ColumnName}]"));
         var sourcePkStagingTable = $"#_source_pks_{Guid.NewGuid():N}"[..40];
 
         try
         {
+            // Get target row count FIRST for safety check
+            var targetCountSql = $"SELECT COUNT(*) FROM [{targetTableName}]";
+            var targetRowCount = await targetConn.ExecuteScalarAsync<long>(targetCountSql, commandTimeout: _commandTimeout);
+            _logger.LogDebug("Target table has {Count:N0} rows", targetRowCount);
+
             // Create a staging table on target for source PKs
             var pkColumnDefs = pkColumns.Select(col =>
             {
@@ -655,7 +683,26 @@ public class SqlServerBulkDataCopier
                 }
             }
 
-            _logger.LogDebug("Loaded {Count:N0} source PKs to staging", sourcePkCount);
+            _logger.LogInformation("Loaded {SourceCount:N0} source PKs (target has {TargetCount:N0} rows)",
+                sourcePkCount, targetRowCount);
+
+            // SAFETY CHECK: If source has dramatically fewer PKs than target, something is wrong
+            // This catches scenarios like chained incremental syncs where source was only partially populated
+            if (targetRowCount > 1000 && sourcePkCount > 0)
+            {
+                var sourceToTargetRatio = (double)sourcePkCount / targetRowCount;
+                if (sourceToTargetRatio < 0.5) // Source has less than 50% of target rows
+                {
+                    _logger.LogError(
+                        "SAFETY ABORT: Source has only {SourceCount:N0} PKs but target has {TargetCount:N0} rows " +
+                        "(ratio: {Ratio:P1}). This would delete {DeleteCount:N0} rows ({DeletePercent:P1} of target). " +
+                        "This likely indicates a data issue (e.g., chained incremental sync where source is incomplete). " +
+                        "Skipping delete sync for safety. Use FullRefresh mode or verify source data.",
+                        sourcePkCount, targetRowCount, sourceToTargetRatio,
+                        targetRowCount - sourcePkCount, 1 - sourceToTargetRatio);
+                    return 0;
+                }
+            }
 
             // Create index on staging table for faster join
             var pkIndexColumns = string.Join(", ", pkColumns.Select(c => $"[{c.ColumnName}]"));
@@ -666,11 +713,35 @@ public class SqlServerBulkDataCopier
             var joinCondition = string.Join(" AND ",
                 pkColumns.Select(c => $"t.[{c.ColumnName}] = s.[{c.ColumnName}]"));
 
+            // Build incremental scope WHERE clause (safety marker)
+            // This restricts deletes to only rows within the incremental sync window
+            string incrementalWhereClause = "";
+            if (incrementalScope != null)
+            {
+                string timestampExpression;
+                if (!string.IsNullOrEmpty(incrementalScope.FallbackTimestampColumn))
+                {
+                    timestampExpression = $"COALESCE(t.[{incrementalScope.TimestampColumn}], t.[{incrementalScope.FallbackTimestampColumn}])";
+                }
+                else
+                {
+                    timestampExpression = $"t.[{incrementalScope.TimestampColumn}]";
+                }
+
+                // SAFETY MARKER: Only delete rows where timestamp >= cutoff time
+                // This prevents deleting rows outside the incremental sync window
+                incrementalWhereClause = $" AND {timestampExpression} >= '{incrementalScope.CutoffTime:yyyy-MM-dd HH:mm:ss.fff}'";
+
+                _logger.LogDebug(
+                    "Incremental delete scope: only considering rows where {TimestampExpr} >= {CutoffTime}",
+                    timestampExpression, incrementalScope.CutoffTime);
+            }
+
             var countSql = $@"
                 SELECT COUNT(*)
                 FROM [{targetTableName}] t
                 LEFT JOIN [{sourcePkStagingTable}] s ON {joinCondition}
-                WHERE s.[{pkColumns[0].ColumnName}] IS NULL";
+                WHERE s.[{pkColumns[0].ColumnName}] IS NULL{incrementalWhereClause}";
 
             var deleteCount = await targetConn.ExecuteScalarAsync<long>(countSql, commandTimeout: _commandTimeout);
 
@@ -680,14 +751,41 @@ public class SqlServerBulkDataCopier
                 return 0;
             }
 
-            _logger.LogInformation("Deleting {Count:N0} rows from target (not in source)", deleteCount);
+            // SAFETY CHECK: Abort if deleting more than 10% of target rows
+            const double maxDeleteRatio = 0.10; // 10%
+            if (targetRowCount > 1000) // Only apply threshold for tables with significant data
+            {
+                var deleteRatio = (double)deleteCount / targetRowCount;
+                if (deleteRatio > maxDeleteRatio)
+                {
+                    _logger.LogError(
+                        "SAFETY ABORT: Would delete {DeleteCount:N0} rows ({DeletePercent:P1} of target's {TargetCount:N0} rows). " +
+                        "This exceeds the safety threshold of {Threshold:P0}. " +
+                        "This likely indicates a configuration issue or data mismatch. " +
+                        "Review the sync configuration or use FullRefresh mode for a complete resync.",
+                        deleteCount, deleteRatio, targetRowCount, maxDeleteRatio);
+                    return 0;
+                }
+            }
+
+            if (incrementalScope != null)
+            {
+                _logger.LogInformation(
+                    "Deleting {Count:N0} rows from target (not in source, within incremental scope)",
+                    deleteCount);
+            }
+            else
+            {
+                _logger.LogInformation("Deleting {Count:N0} rows from target (not in source)", deleteCount);
+            }
 
             // Delete rows not in source using efficient SQL
+            // The incrementalWhereClause restricts deletes to rows within sync window when applicable
             var deleteSql = $@"
                 DELETE t
                 FROM [{targetTableName}] t
                 LEFT JOIN [{sourcePkStagingTable}] s ON {joinCondition}
-                WHERE s.[{pkColumns[0].ColumnName}] IS NULL";
+                WHERE s.[{pkColumns[0].ColumnName}] IS NULL{incrementalWhereClause}";
 
             var rowsDeleted = await targetConn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
             return rowsDeleted;
@@ -749,4 +847,27 @@ public class SqlServerBulkDataCopier
         var baseType = sqlType.ToLower();
         return baseType == "geometry" || baseType == "geography";
     }
+}
+
+/// <summary>
+/// Defines the scope for incremental delete operations.
+/// When provided, deletes are restricted to only rows within the incremental sync window.
+/// </summary>
+internal class IncrementalDeleteScope
+{
+    /// <summary>
+    /// The timestamp column used to determine row age
+    /// </summary>
+    public string TimestampColumn { get; set; } = null!;
+
+    /// <summary>
+    /// Fallback column when TimestampColumn is NULL
+    /// </summary>
+    public string? FallbackTimestampColumn { get; set; }
+
+    /// <summary>
+    /// Only delete rows where timestamp >= this cutoff time
+    /// This prevents deleting rows outside the incremental sync window
+    /// </summary>
+    public DateTime CutoffTime { get; set; }
 }
