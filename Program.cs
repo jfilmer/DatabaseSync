@@ -54,13 +54,16 @@ try
     // HTTP API Endpoints
     // ══════════════════════════════════════════════════════════════
 
-    // Health check
-    app.MapGet("/health", () => Results.Ok(new 
-    { 
-        Status = "healthy", 
-        Time = DateTime.UtcNow,
-        Profiles = config.Profiles.Count
-    })).WithName("HealthCheck");
+    // Health check (conditionally enabled)
+    if (config.EnableHealthChecks)
+    {
+        app.MapGet("/health", () => Results.Ok(new
+        {
+            Status = "healthy",
+            Time = DateTime.UtcNow,
+            Profiles = config.Profiles.Count
+        })).WithName("HealthCheck");
+    }
 
     // Get status of all profiles
     app.MapGet("/status", (ProfileScheduler scheduler) =>
@@ -205,7 +208,8 @@ try
     
     Log.Information("");
     Log.Information("HTTP API available at: {Url}", url);
-    Log.Information("  GET  /health              - Health check");
+    if (config.EnableHealthChecks)
+        Log.Information("  GET  /health              - Health check");
     Log.Information("  GET  /status              - Status of all profiles");
     Log.Information("  GET  /status/{{profile}}    - Status of specific profile");
     Log.Information("  GET  /profiles            - List profile names");
