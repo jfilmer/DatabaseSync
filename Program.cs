@@ -19,6 +19,37 @@ Log.Logger = new LoggerConfiguration()
         outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
     .CreateLogger();
 
+// Single-instance check using file lock
+var lockFilePath = Path.Combine(AppContext.BaseDirectory, ".database-sync.lock");
+FileStream? lockFile = null;
+
+try
+{
+    lockFile = new FileStream(lockFilePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+    // Write PID to lock file for debugging
+    lockFile.SetLength(0);
+    using var writer = new StreamWriter(lockFile, leaveOpen: true);
+    writer.WriteLine($"PID: {Environment.ProcessId}");
+    writer.WriteLine($"Started: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+    writer.Flush();
+}
+catch (IOException)
+{
+    // Another instance is running
+    Console.ForegroundColor = ConsoleColor.Red;
+    Console.WriteLine("╔══════════════════════════════════════════════════════════════╗");
+    Console.WriteLine("║  ERROR: Another instance of DatabaseSync is already running  ║");
+    Console.WriteLine("╚══════════════════════════════════════════════════════════════╝");
+    Console.ResetColor();
+    Console.WriteLine();
+    Console.WriteLine($"Lock file: {lockFilePath}");
+    Console.WriteLine();
+    Console.WriteLine("If no other instance is running, delete the lock file and try again.");
+    Console.WriteLine("Or kill the existing process first.");
+    Log.Fatal("Another instance is already running. Lock file: {LockFile}", lockFilePath);
+    return 1;
+}
+
 try
 {
     Log.Information("╔══════════════════════════════════════════════════════════════╗");
@@ -29,21 +60,38 @@ try
     builder.Services.AddSerilog();
 
     // Load configuration
-    var config = builder.Configuration.GetSection("SyncService").Get<SyncServiceConfig>() 
+    var config = builder.Configuration.GetSection("SyncService").Get<SyncServiceConfig>()
         ?? new SyncServiceConfig();
 
     // Validate configuration
-    if (!config.Profiles.Any())
+    var validationResult = ConfigurationValidator.Validate(config);
+
+    if (validationResult.Errors.Any())
     {
-        Log.Warning("No profiles configured. Add profiles to appsettings.json to enable sync.");
+        Log.Error("Configuration validation failed with {Count} error(s):", validationResult.Errors.Count);
+        foreach (var error in validationResult.Errors)
+        {
+            Log.Error("  - {Error}", error);
+        }
     }
-    else
+
+    if (validationResult.Warnings.Any())
     {
-        Log.Information("Loaded {Count} sync profile(s)", config.Profiles.Count);
+        Log.Warning("Configuration has {Count} warning(s):", validationResult.Warnings.Count);
+        foreach (var warning in validationResult.Warnings)
+        {
+            Log.Warning("  - {Warning}", warning);
+        }
+    }
+
+    if (validationResult.IsValid && !validationResult.HasWarnings)
+    {
+        Log.Information("Configuration validated successfully - {Count} profile(s) loaded", config.Profiles.Count);
     }
 
     // Register services
     builder.Services.AddSingleton(config);
+    builder.Services.AddSingleton(validationResult);
     builder.Services.AddSingleton<TypeMapper>();
     builder.Services.AddSingleton<ProfileScheduler>();
     builder.Services.AddHostedService(sp => sp.GetRequiredService<ProfileScheduler>());
@@ -131,6 +179,43 @@ try
         }
     }).WithName("TriggerProfileSync");
 
+    // Trigger sync for a specific table in a profile
+    app.MapPost("/sync/{profileName}/{tableName}", async (
+        string profileName,
+        string tableName,
+        bool? fullRefresh,
+        ProfileScheduler scheduler) =>
+    {
+        try
+        {
+            Log.Information("API: Table sync triggered for '{Profile}/{Table}' (fullRefresh: {FullRefresh})",
+                profileName, tableName, fullRefresh ?? false);
+
+            var result = await scheduler.TriggerTableAsync(profileName, tableName, fullRefresh ?? false);
+
+            return Results.Ok(new
+            {
+                Profile = profileName,
+                Table = tableName,
+                Success = result.Success,
+                RowsProcessed = result.RowsProcessed,
+                RowsInserted = result.RowsInserted,
+                RowsUpdated = result.RowsUpdated,
+                RowsDeleted = result.RowsDeleted,
+                Duration = FormatDuration(result.Duration.TotalSeconds),
+                Error = result.Error
+            });
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.NotFound(new { Error = ex.Message });
+        }
+        catch (InvalidOperationException ex)
+        {
+            return Results.Conflict(new { Error = ex.Message });
+        }
+    }).WithName("TriggerTableSync");
+
     // Trigger sync for all enabled profiles
     app.MapPost("/sync", async (bool? fullRefresh, ProfileScheduler scheduler) =>
     {
@@ -164,6 +249,20 @@ try
         return Results.Ok(results);
     }).WithName("TriggerAllSync");
 
+    // Get startup delay status
+    app.MapGet("/startup-delay", (ProfileScheduler scheduler) =>
+    {
+        var status = scheduler.GetStartupDelayStatus();
+        return Results.Ok(status);
+    }).WithName("GetStartupDelayStatus");
+
+    // Cancel startup delay and start syncs immediately
+    app.MapPost("/startup-delay/cancel", (ProfileScheduler scheduler) =>
+    {
+        scheduler.CancelStartupDelay();
+        return Results.Ok(new { Message = "Startup delay cancelled - syncs will begin immediately" });
+    }).WithName("CancelStartupDelay");
+
     // Get sync history for a profile (JSON)
     app.MapGet("/history/{profileName}", async (string profileName, int? limit, ProfileScheduler scheduler) =>
     {
@@ -172,7 +271,7 @@ try
     }).WithName("GetSyncHistory");
 
     // HTML Dashboard - shows sync history for all profiles
-    app.MapGet("/dashboard", async (ProfileScheduler scheduler) =>
+    app.MapGet("/dashboard", async (ProfileScheduler scheduler, ConfigurationValidationResult configValidation) =>
     {
         var profiles = scheduler.GetProfileNames().ToList();
         var allHistory = new Dictionary<string, List<DatabaseSync.Models.SyncHistory>>();
@@ -182,7 +281,8 @@ try
             allHistory[profile] = await scheduler.GetSyncHistoryAsync(profile, 100);
         }
 
-        var html = GenerateDashboardHtml(scheduler.GetAllProfileStatus().ToList(), allHistory);
+        var startupDelay = scheduler.GetStartupDelayStatus();
+        var html = GenerateDashboardHtml(scheduler.GetAllProfileStatus().ToList(), allHistory, configValidation, startupDelay);
         return Results.Content(html, "text/html");
     }).WithName("Dashboard");
 
@@ -199,6 +299,88 @@ try
         var html = GenerateProfileDashboardHtml(status, history);
         return Results.Content(html, "text/html");
     }).WithName("ProfileDashboard");
+
+    // Admin: Get orphaned profile names in history (profiles that exist in history but not in config)
+    app.MapGet("/admin/orphaned-profiles/{profileName}", async (string profileName, ProfileScheduler scheduler) =>
+    {
+        var profile = scheduler.GetProfile(profileName);
+        if (profile == null)
+        {
+            return Results.NotFound(new { Error = $"Profile '{profileName}' not found in config" });
+        }
+
+        // Get history repository for this profile's target database
+        DatabaseSync.Abstractions.ISyncHistoryRepository historyRepo;
+        if (profile.TargetConnection.DatabaseType == DatabaseSync.Enums.DatabaseType.PostgreSql)
+        {
+            historyRepo = new DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository(
+                profile.TargetConnection.ConnectionString,
+                app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository>());
+        }
+        else
+        {
+            historyRepo = new DatabaseSync.SqlServer.SqlServerSyncHistoryRepository(
+                profile.TargetConnection.ConnectionString,
+                app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.SqlServer.SqlServerSyncHistoryRepository>());
+        }
+
+        await historyRepo.InitializeAsync();
+        var historyProfiles = await historyRepo.GetProfileNamesFromHistoryAsync();
+        var configProfiles = config.Profiles.Select(p => p.EffectiveProfileId).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var orphanedProfiles = historyProfiles.Where(h => !configProfiles.Contains(h)).ToList();
+
+        return Results.Ok(new
+        {
+            Database = profile.TargetConnection.ConnectionString.Split(';')
+                .FirstOrDefault(p => p.StartsWith("Database=", StringComparison.OrdinalIgnoreCase) ||
+                                     p.StartsWith("Initial Catalog=", StringComparison.OrdinalIgnoreCase)),
+            ConfiguredProfiles = configProfiles.ToList(),
+            ProfilesInHistory = historyProfiles,
+            OrphanedProfiles = orphanedProfiles
+        });
+    }).WithName("GetOrphanedProfiles");
+
+    // Admin: Rename profile in history (migrate old records to new profile ID)
+    app.MapPost("/admin/rename-profile/{profileName}", async (
+        string profileName,
+        string oldProfileId,
+        string newProfileId,
+        ProfileScheduler scheduler) =>
+    {
+        var profile = scheduler.GetProfile(profileName);
+        if (profile == null)
+        {
+            return Results.NotFound(new { Error = $"Profile '{profileName}' not found in config" });
+        }
+
+        // Get history repository for this profile's target database
+        DatabaseSync.Abstractions.ISyncHistoryRepository historyRepo;
+        if (profile.TargetConnection.DatabaseType == DatabaseSync.Enums.DatabaseType.PostgreSql)
+        {
+            historyRepo = new DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository(
+                profile.TargetConnection.ConnectionString,
+                app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository>());
+        }
+        else
+        {
+            historyRepo = new DatabaseSync.SqlServer.SqlServerSyncHistoryRepository(
+                profile.TargetConnection.ConnectionString,
+                app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.SqlServer.SqlServerSyncHistoryRepository>());
+        }
+
+        await historyRepo.InitializeAsync();
+        var updated = await historyRepo.RenameProfileAsync(oldProfileId, newProfileId);
+
+        Log.Information("Renamed profile '{OldId}' to '{NewId}' in {Count} history records",
+            oldProfileId, newProfileId, updated);
+
+        return Results.Ok(new
+        {
+            OldProfileId = oldProfileId,
+            NewProfileId = newProfileId,
+            RecordsUpdated = updated
+        });
+    }).WithName("RenameProfile");
 
     // ══════════════════════════════════════════════════════════════
     // Start the application
@@ -240,7 +422,9 @@ return 0;
 
 static string GenerateDashboardHtml(
     List<DatabaseSync.Models.ProfileStatusInfo> profiles,
-    Dictionary<string, List<DatabaseSync.Models.SyncHistory>> allHistory)
+    Dictionary<string, List<DatabaseSync.Models.SyncHistory>> allHistory,
+    ConfigurationValidationResult? validationResult = null,
+    DatabaseSync.Services.StartupDelayStatus? startupDelay = null)
 {
     var sb = new System.Text.StringBuilder();
     sb.Append(@"<!DOCTYPE html>
@@ -256,6 +440,12 @@ static string GenerateDashboardHtml(
         .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
         h1 { color: #00d9ff; }
         .refresh-info { color: #888; font-size: 0.9em; }
+        .config-alert { padding: 15px 20px; border-radius: 8px; margin-bottom: 20px; }
+        .config-alert-error { background: #5a1a1a; border: 1px solid #dc3545; color: #ff6b6b; }
+        .config-alert-warning { background: #5a4a1a; border: 1px solid #ffc107; color: #ffd93d; }
+        .config-alert-title { font-weight: bold; margin-bottom: 8px; font-size: 1.1em; }
+        .config-alert ul { margin: 0; padding-left: 20px; }
+        .config-alert li { margin: 4px 0; }
         .profiles { display: grid; gap: 20px; }
         .profile-card { background: #16213e; border-radius: 8px; padding: 20px; border-left: 4px solid #00d9ff; }
         .profile-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
@@ -287,13 +477,120 @@ static string GenerateDashboardHtml(
         .view-link { color: #00d9ff; text-decoration: none; }
         .view-link:hover { text-decoration: underline; }
         .no-data { color: #888; font-style: italic; padding: 20px; text-align: center; }
+        .startup-delay-banner { background: linear-gradient(135deg, #1e3a5f 0%, #16213e 100%); border: 2px solid #ffc107; border-radius: 8px; padding: 20px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
+        .startup-delay-info { flex: 1; }
+        .startup-delay-title { color: #ffc107; font-size: 1.2em; font-weight: bold; margin-bottom: 8px; }
+        .startup-delay-text { color: #eee; }
+        .startup-delay-countdown { font-size: 2em; font-weight: bold; color: #00d9ff; font-family: monospace; min-width: 80px; text-align: center; }
+        .start-now-btn { background: #28a745; color: #fff; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-size: 1.1em; font-weight: bold; margin-left: 20px; transition: background 0.2s; }
+        .start-now-btn:hover { background: #218838; }
+        .start-now-btn:disabled { background: #666; cursor: not-allowed; }
     </style>
+    <script>
+        let countdownInterval = null;
+        function startCountdown(seconds) {
+            const countdownEl = document.getElementById('countdown');
+            const bannerEl = document.getElementById('startup-delay-banner');
+            if (!countdownEl || !bannerEl) return;
+
+            let remaining = seconds;
+            function update() {
+                if (remaining <= 0) {
+                    clearInterval(countdownInterval);
+                    bannerEl.style.display = 'none';
+                    location.reload();
+                    return;
+                }
+                countdownEl.textContent = remaining + 's';
+                remaining--;
+            }
+            update();
+            countdownInterval = setInterval(update, 1000);
+        }
+
+        async function startNow() {
+            const btn = document.getElementById('start-now-btn');
+            const bannerEl = document.getElementById('startup-delay-banner');
+            btn.disabled = true;
+            btn.textContent = 'Starting...';
+
+            try {
+                const response = await fetch('/startup-delay/cancel', { method: 'POST' });
+                if (response.ok) {
+                    clearInterval(countdownInterval);
+                    btn.textContent = 'Started!';
+                    btn.style.background = '#28a745';
+                    setTimeout(() => {
+                        bannerEl.style.display = 'none';
+                        location.reload();
+                    }, 500);
+                } else {
+                    btn.textContent = 'Failed';
+                    btn.style.background = '#dc3545';
+                }
+            } catch (e) {
+                btn.textContent = 'Error';
+                btn.style.background = '#dc3545';
+            }
+        }
+    </script>
 </head>
 <body>
     <div class=""header"">
         <h1>Database Sync Dashboard</h1>
         <span class=""refresh-info"">Auto-refresh: 30s | Last updated: " + DateTime.Now.ToString("HH:mm:ss") + @"</span>
+    </div>");
+
+    // Display startup delay banner if active
+    if (startupDelay?.IsActive == true)
+    {
+        sb.Append($@"
+    <div id=""startup-delay-banner"" class=""startup-delay-banner"">
+        <div class=""startup-delay-info"">
+            <div class=""startup-delay-title"">Startup Delay Active</div>
+            <div class=""startup-delay-text"">Automatic sync is paused. Use table sync buttons or click Start Now to begin all scheduled syncs.</div>
+        </div>
+        <div id=""countdown"" class=""startup-delay-countdown"">{startupDelay.SecondsRemaining}s</div>
+        <button id=""start-now-btn"" class=""start-now-btn"" onclick=""startNow()"">Start Now</button>
     </div>
+    <script>startCountdown({startupDelay.SecondsRemaining});</script>");
+    }
+
+    // Display configuration errors
+    if (validationResult?.Errors.Any() == true)
+    {
+        sb.Append(@"
+    <div class=""config-alert config-alert-error"">
+        <div class=""config-alert-title"">⚠ Configuration Errors</div>
+        <ul>");
+        foreach (var error in validationResult.Errors)
+        {
+            sb.Append($@"
+            <li>{System.Web.HttpUtility.HtmlEncode(error)}</li>");
+        }
+        sb.Append(@"
+        </ul>
+    </div>");
+    }
+
+    // Display configuration warnings
+    if (validationResult?.Warnings.Any() == true)
+    {
+        sb.Append(@"
+    <div class=""config-alert config-alert-warning"">
+        <div class=""config-alert-title"">⚠ Configuration Warnings</div>
+        <ul>");
+        foreach (var warning in validationResult.Warnings)
+        {
+            sb.Append($@"
+            <li>{System.Web.HttpUtility.HtmlEncode(warning)}</li>");
+        }
+        sb.Append(@"
+        </ul>
+    </div>");
+    }
+
+    sb.Append(@"
     <div class=""profiles"">");
 
     foreach (var profile in profiles)
@@ -324,9 +621,25 @@ static string GenerateDashboardHtml(
         if (profile.IsRunning)
         {
             var startTimeStr = profile.CurrentRunStartTime?.ToLocalTime().ToString("HH:mm:ss") ?? "Unknown";
-            var tablesStr = profile.CurrentTables.Any()
-                ? $" | Syncing: {string.Join(", ", profile.CurrentTables.Select(t => System.Web.HttpUtility.HtmlEncode(t)))}"
-                : "";
+            var tablesStr = "";
+            if (profile.CurrentTableProgress.Any())
+            {
+                var tableProgress = profile.CurrentTableProgress.Select(p =>
+                {
+                    var name = System.Web.HttpUtility.HtmlEncode(p.TableName);
+                    var elapsed = (DateTime.UtcNow - p.StartTime).TotalSeconds;
+                    var elapsedStr = elapsed < 60 ? $"{elapsed:F0}s" : $"{elapsed / 60:F1}m";
+
+                    // Show progress if we have an estimate
+                    if (p.EstimatedTotalRows > 0 && p.RowsProcessed > 0)
+                    {
+                        var pct = Math.Min(100, p.RowsProcessed * 100 / p.EstimatedTotalRows);
+                        return $"{name} ({pct}% - {elapsedStr})";
+                    }
+                    return $"{name} ({elapsedStr})";
+                });
+                tablesStr = $" | Syncing: {string.Join(", ", tableProgress)}";
+            }
             runningInfoHtml = $@"<div class=""current-tables"">Started: {startTimeStr}{tablesStr}</div>";
         }
 
@@ -343,7 +656,7 @@ static string GenerateDashboardHtml(
                 {System.Web.HttpUtility.HtmlEncode(profile.Description ?? "")} |
                 {profile.TableCount} tables |
                 {System.Web.HttpUtility.HtmlEncode(profile.ScheduleDescription)}{nextRunStr} |
-                <a href=""/dashboard/{System.Web.HttpUtility.UrlEncode(profile.ProfileName)}"" class=""view-link"">View Details</a>
+                <a href=""/dashboard/{Uri.EscapeDataString(profile.ProfileName)}"" class=""view-link"">View Details</a>
             </div>
             <div class=""stats"">
                 <div class=""stat"">
@@ -521,7 +834,52 @@ static string GenerateProfileDashboardHtml(
         .number {{ text-align: right; font-family: monospace; }}
         .timestamp {{ color: #888; font-size: 0.85em; }}
         .error-msg {{ color: #dc3545; font-size: 0.85em; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .sync-btn {{ background: #0f3460; color: #00d9ff; border: 1px solid #00d9ff; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 0.85em; }}
+        .sync-btn:hover {{ background: #00d9ff; color: #0f3460; }}
+        .sync-btn:disabled {{ background: #333; color: #666; border-color: #666; cursor: not-allowed; }}
     </style>
+    <script>
+        async function triggerSync(profile, table) {{
+            const btn = event.target;
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Syncing...';
+
+            try {{
+                const response = await fetch(`/sync/${{profile}}/${{table}}`, {{ method: 'POST' }});
+                const result = await response.json();
+
+                if (response.ok && result.Success) {{
+                    btn.textContent = 'Done!';
+                    btn.style.background = '#28a745';
+                    btn.style.borderColor = '#28a745';
+                    setTimeout(() => location.reload(), 1500);
+                }} else {{
+                    btn.textContent = 'Failed';
+                    btn.style.background = '#dc3545';
+                    btn.style.borderColor = '#dc3545';
+                    alert('Sync failed: ' + (result.Error || 'Unknown error'));
+                    setTimeout(() => {{
+                        btn.textContent = originalText;
+                        btn.style.background = '';
+                        btn.style.borderColor = '';
+                        btn.disabled = false;
+                    }}, 2000);
+                }}
+            }} catch (err) {{
+                btn.textContent = 'Error';
+                btn.style.background = '#dc3545';
+                btn.style.borderColor = '#dc3545';
+                alert('Request failed: ' + err.message);
+                setTimeout(() => {{
+                    btn.textContent = originalText;
+                    btn.style.background = '';
+                    btn.style.borderColor = '';
+                    btn.disabled = false;
+                }}, 2000);
+            }}
+        }}
+    </script>
 </head>
 <body>
     <div class=""header"">
@@ -567,11 +925,12 @@ static string GenerateProfileDashboardHtml(
                     <th class=""number"">Recent %</th>
                     <th>Last Sync</th>
                     <th>Status</th>
+                    <th>Actions</th>
                 </tr>
             </thead>
             <tbody>");
 
-    foreach (var table in byTable.OrderBy(t => t.Key))
+    foreach (var table in byTable.OrderByDescending(t => t.Value.Max(h => h.SyncEndTime)))
     {
         var tableHistory = table.Value.Where(h => h.SyncEndTime > DateTime.UtcNow.AddHours(-24)).ToList();
         var lastSync = table.Value.OrderByDescending(h => h.SyncEndTime).FirstOrDefault();
@@ -598,6 +957,7 @@ static string GenerateProfileDashboardHtml(
                     <td class=""number"">{recentPercentStr}</td>
                     <td class=""timestamp"">{lastSync?.SyncEndTime.ToLocalTime():MM-dd HH:mm}</td>
                     <td class=""{statusClass}"">{(lastSync?.Success == true ? "OK" : "FAIL")}</td>
+                    <td><button class=""sync-btn"" onclick=""triggerSync('{Uri.EscapeDataString(profile.ProfileName)}', '{Uri.EscapeDataString(table.Key)}')"">Sync</button></td>
                 </tr>");
     }
 

@@ -45,6 +45,14 @@ public class SyncServiceConfig
     /// Sync profiles - each profile defines a source/target pair with its own schedule
     /// </summary>
     public List<SyncProfile> Profiles { get; set; } = new();
+
+    /// <summary>
+    /// Startup delay in seconds before RunImmediatelyOnStart syncs begin.
+    /// This provides a window to access the dashboard and trigger manual table syncs
+    /// before automatic syncs start. Set to 0 for immediate start (default).
+    /// The delay can be cancelled via API or dashboard.
+    /// </summary>
+    public int StartupDelaySeconds { get; set; } = 0;
 }
 
 /// <summary>
@@ -194,10 +202,22 @@ public enum ProfileExecutionMode
 public class SyncProfile
 {
     /// <summary>
+    /// Unique stable identifier for this profile. Auto-generated if not specified.
+    /// This ID is used in sync history and survives profile name changes.
+    /// </summary>
+    public string? ProfileId { get; set; }
+
+    /// <summary>
     /// Unique name for this profile (e.g., "Production", "Reporting", "Archive")
     /// </summary>
     public string ProfileName { get; set; } = "Default";
-    
+
+    /// <summary>
+    /// Gets the effective profile ID. If ProfileId is not specified,
+    /// returns the ProfileName (for backward compatibility with existing history).
+    /// </summary>
+    public string EffectiveProfileId => !string.IsNullOrEmpty(ProfileId) ? ProfileId : ProfileName;
+
     /// <summary>
     /// Optional description of what this profile does
     /// </summary>

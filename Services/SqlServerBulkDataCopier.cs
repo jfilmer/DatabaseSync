@@ -20,6 +20,19 @@ public class SqlServerBulkDataCopier
     private readonly ILogger<SqlServerBulkDataCopier> _logger;
     private readonly int _commandTimeout;
 
+    /// <summary>
+    /// Batch size for MERGE operations on very large tables.
+    /// Default is 1,000,000 rows per batch to avoid command timeouts.
+    /// Set to 0 to disable batching (process all rows in single MERGE).
+    /// </summary>
+    public int MergeBatchSize { get; set; } = 1_000_000;
+
+    /// <summary>
+    /// Optional callback for progress updates (rowsProcessed)
+    /// Called every 100,000 rows during bulk load
+    /// </summary>
+    public Action<long>? ProgressCallback { get; set; }
+
     public SqlServerBulkDataCopier(
         string sourceConnectionString,
         string targetConnectionString,
@@ -124,7 +137,7 @@ public class SqlServerBulkDataCopier
             // Execute upsert using MERGE (with IDENTITY_INSERT if needed)
             _logger.LogInformation("Executing MERGE upsert to target table...");
             var mergeResult = await ExecuteMergeAsync(targetConn, stagingTableName, targetTableName,
-                allColumns, updateColumns, pkColumns, hasIdentity);
+                allColumns, updateColumns, pkColumns, hasIdentity, result.RowsProcessed);
 
             // Use actual counts from MERGE OUTPUT
             result.RowsInserted = mergeResult.Inserted;
@@ -245,7 +258,7 @@ public class SqlServerBulkDataCopier
             }
 
             var mergeResult = await ExecuteMergeAsync(targetConn, stagingTableName, targetTableName,
-                allColumns, updateColumns, pkColumns, hasIdentity);
+                allColumns, updateColumns, pkColumns, hasIdentity, result.RowsProcessed);
 
             // Use actual counts from MERGE OUTPUT
             result.RowsInserted = mergeResult.Inserted;
@@ -348,6 +361,7 @@ public class SqlServerBulkDataCopier
             {
                 await BulkInsertDataTableAsync(targetConn, stagingTableName, dataTable, columns);
                 _logger.LogDebug("Loaded {Rows:N0} rows to staging...", rowsLoaded);
+                ProgressCallback?.Invoke(rowsLoaded);
                 dataTable.Clear();
             }
         }
@@ -384,6 +398,27 @@ public class SqlServerBulkDataCopier
     }
 
     private async Task<(long Inserted, long Updated)> ExecuteMergeAsync(
+        SqlConnection conn,
+        string stagingTable,
+        string targetTable,
+        List<ColumnInfo> insertColumns,
+        List<ColumnInfo> updateColumns,
+        List<ColumnInfo> pkColumns,
+        bool hasIdentity,
+        long totalRows = 0)
+    {
+        // For very large tables, use batched MERGE to avoid timeout
+        if (MergeBatchSize > 0 && totalRows > MergeBatchSize)
+        {
+            return await ExecuteBatchedMergeAsync(conn, stagingTable, targetTable,
+                insertColumns, updateColumns, pkColumns, hasIdentity, totalRows);
+        }
+
+        return await ExecuteSingleMergeAsync(conn, stagingTable, targetTable,
+            insertColumns, updateColumns, pkColumns, hasIdentity);
+    }
+
+    private async Task<(long Inserted, long Updated)> ExecuteSingleMergeAsync(
         SqlConnection conn,
         string stagingTable,
         string targetTable,
@@ -488,6 +523,166 @@ public class SqlServerBulkDataCopier
         var result = await conn.QueryFirstOrDefaultAsync<(long Inserted, long Updated)>(
             sqlBuilder.ToString(), commandTimeout: _commandTimeout);
         return result;
+    }
+
+    /// <summary>
+    /// Execute MERGE in batches for very large tables to avoid command timeouts.
+    /// Uses ROW_NUMBER() to partition the staging table into chunks.
+    /// </summary>
+    private async Task<(long Inserted, long Updated)> ExecuteBatchedMergeAsync(
+        SqlConnection conn,
+        string stagingTable,
+        string targetTable,
+        List<ColumnInfo> insertColumns,
+        List<ColumnInfo> updateColumns,
+        List<ColumnInfo> pkColumns,
+        bool hasIdentity,
+        long totalRows)
+    {
+        var batchCount = (int)Math.Ceiling((double)totalRows / MergeBatchSize);
+        _logger.LogInformation(
+            "Large table detected ({TotalRows:N0} rows). Executing MERGE in {BatchCount} batches of {BatchSize:N0} rows each",
+            totalRows, batchCount, MergeBatchSize);
+
+        long totalInserted = 0;
+        long totalUpdated = 0;
+
+        var insertColumnList = string.Join(", ", insertColumns.Select(c => $"[{c.ColumnName}]"));
+        var pkColumnList = string.Join(", ", pkColumns.Select(c => $"[{c.ColumnName}]"));
+
+        // For spatial columns, cast from varbinary back to geometry/geography
+        var sourceColumnList = string.Join(", ", insertColumns.Select(c =>
+            IsSpatialType(c.DataType)
+                ? $"CAST(s.[{c.ColumnName}] AS {c.DataType})"
+                : $"s.[{c.ColumnName}]"));
+
+        // Build ON clause for matching
+        var matchCondition = string.Join(" AND ",
+            pkColumns.Select(c => $"t.[{c.ColumnName}] = s.[{c.ColumnName}]"));
+
+        // Build update clause if there are columns to update
+        string? updateSetClause = null;
+        string? changeDetectionClause = null;
+        if (updateColumns.Any())
+        {
+            updateSetClause = string.Join(", ",
+                updateColumns.Select(c =>
+                    IsSpatialType(c.DataType)
+                        ? $"t.[{c.ColumnName}] = CAST(s.[{c.ColumnName}] AS {c.DataType})"
+                        : $"t.[{c.ColumnName}] = s.[{c.ColumnName}]"));
+
+            var changeConditions = updateColumns.Select(c =>
+            {
+                if (IsSpatialType(c.DataType))
+                {
+                    return $"ISNULL(NULLIF(CAST(t.[{c.ColumnName}] AS varbinary(MAX)), s.[{c.ColumnName}]), NULLIF(s.[{c.ColumnName}], CAST(t.[{c.ColumnName}] AS varbinary(MAX)))) IS NOT NULL";
+                }
+                else
+                {
+                    return $"ISNULL(NULLIF(t.[{c.ColumnName}], s.[{c.ColumnName}]), NULLIF(s.[{c.ColumnName}], t.[{c.ColumnName}])) IS NOT NULL";
+                }
+            });
+            changeDetectionClause = string.Join(" OR ", changeConditions);
+        }
+
+        // First, add a row number column to the staging table for batching
+        var rowNumColumn = "_batch_row_num";
+
+        // Step 1: Add the column
+        await conn.ExecuteAsync($"ALTER TABLE [{stagingTable}] ADD [{rowNumColumn}] BIGINT NULL;",
+            commandTimeout: _commandTimeout);
+
+        // Step 2: Populate with row numbers (must be separate statement after ALTER TABLE commits)
+        var updateRowNumSql = $@"
+            WITH Numbered AS (
+                SELECT [{rowNumColumn}], ROW_NUMBER() OVER (ORDER BY {pkColumnList}) AS rn
+                FROM [{stagingTable}]
+            )
+            UPDATE Numbered SET [{rowNumColumn}] = rn;";
+        await conn.ExecuteAsync(updateRowNumSql, commandTimeout: _commandTimeout);
+
+        // Step 3: Create index for efficient batch queries
+        await conn.ExecuteAsync($"CREATE INDEX IX_BatchRowNum ON [{stagingTable}] ([{rowNumColumn}]);",
+            commandTimeout: _commandTimeout);
+
+        // Process each batch
+        for (int batch = 0; batch < batchCount; batch++)
+        {
+            var startRow = (long)batch * MergeBatchSize + 1;
+            var endRow = Math.Min((long)(batch + 1) * MergeBatchSize, totalRows);
+
+            _logger.LogDebug("Processing MERGE batch {Batch}/{Total} (rows {Start:N0} to {End:N0})",
+                batch + 1, batchCount, startRow, endRow);
+
+            var sqlBuilder = new System.Text.StringBuilder();
+
+            if (hasIdentity)
+            {
+                sqlBuilder.AppendLine($"SET IDENTITY_INSERT [{targetTable}] ON;");
+            }
+
+            if (updateColumns.Any())
+            {
+                sqlBuilder.AppendLine($@"
+                    DECLARE @MergeOutput TABLE (Action NVARCHAR(10));
+
+                    MERGE INTO [{targetTable}] AS t
+                    USING (SELECT {insertColumnList} FROM [{stagingTable}] WHERE [{rowNumColumn}] BETWEEN {startRow} AND {endRow}) AS s
+                    ON {matchCondition}
+                    WHEN MATCHED AND ({changeDetectionClause}) THEN
+                        UPDATE SET {updateSetClause}
+                    WHEN NOT MATCHED THEN
+                        INSERT ({insertColumnList})
+                        VALUES ({sourceColumnList})
+                    OUTPUT $action INTO @MergeOutput;
+
+                    SELECT
+                        SUM(CASE WHEN Action = 'INSERT' THEN 1 ELSE 0 END) AS Inserted,
+                        SUM(CASE WHEN Action = 'UPDATE' THEN 1 ELSE 0 END) AS Updated
+                    FROM @MergeOutput;");
+            }
+            else
+            {
+                sqlBuilder.AppendLine($@"
+                    DECLARE @MergeOutput TABLE (Action NVARCHAR(10));
+
+                    MERGE INTO [{targetTable}] AS t
+                    USING (SELECT {insertColumnList} FROM [{stagingTable}] WHERE [{rowNumColumn}] BETWEEN {startRow} AND {endRow}) AS s
+                    ON {matchCondition}
+                    WHEN NOT MATCHED THEN
+                        INSERT ({insertColumnList})
+                        VALUES ({sourceColumnList})
+                    OUTPUT $action INTO @MergeOutput;
+
+                    SELECT
+                        SUM(CASE WHEN Action = 'INSERT' THEN 1 ELSE 0 END) AS Inserted,
+                        SUM(CASE WHEN Action = 'UPDATE' THEN 1 ELSE 0 END) AS Updated
+                    FROM @MergeOutput;");
+            }
+
+            if (hasIdentity)
+            {
+                sqlBuilder.AppendLine($"SET IDENTITY_INSERT [{targetTable}] OFF;");
+            }
+
+            var batchResult = await conn.QueryFirstOrDefaultAsync<(long Inserted, long Updated)>(
+                sqlBuilder.ToString(), commandTimeout: _commandTimeout);
+
+            totalInserted += batchResult.Inserted;
+            totalUpdated += batchResult.Updated;
+
+            _logger.LogDebug("Batch {Batch}/{Total} complete: {Inserted:N0} inserted, {Updated:N0} updated",
+                batch + 1, batchCount, batchResult.Inserted, batchResult.Updated);
+
+            // Report progress
+            ProgressCallback?.Invoke(endRow);
+        }
+
+        _logger.LogInformation(
+            "Batched MERGE complete: {TotalInserted:N0} inserted, {TotalUpdated:N0} updated across {BatchCount} batches",
+            totalInserted, totalUpdated, batchCount);
+
+        return (totalInserted, totalUpdated);
     }
 
     /// <summary>

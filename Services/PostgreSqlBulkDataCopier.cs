@@ -19,6 +19,12 @@ public class PostgreSqlBulkDataCopier
     private readonly ILogger<PostgreSqlBulkDataCopier> _logger;
     private readonly int _commandTimeout;
 
+    /// <summary>
+    /// Optional callback for progress updates (rowsProcessed)
+    /// Called every 100,000 rows during bulk load
+    /// </summary>
+    public Action<long>? ProgressCallback { get; set; }
+
     public PostgreSqlBulkDataCopier(
         string sourceConnectionString,
         string targetConnectionString,
@@ -287,6 +293,7 @@ public class PostgreSqlBulkDataCopier
             if (rowsLoaded % 100000 == 0)
             {
                 _logger.LogDebug("Loaded {Rows:N0} rows to staging...", rowsLoaded);
+                ProgressCallback?.Invoke(rowsLoaded);
             }
         }
 

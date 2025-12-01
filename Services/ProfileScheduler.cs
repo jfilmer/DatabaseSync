@@ -21,6 +21,10 @@ public class ProfileScheduler : BackgroundService
     private readonly ConcurrentDictionary<string, ProfileState> _profileStates = new();
     private readonly LoadMonitor _loadMonitor;
 
+    // Startup delay tracking
+    private DateTime? _startupDelayEndTime;
+    private bool _startupDelayCompleted;
+
     public ProfileScheduler(
         IServiceProvider services,
         SyncServiceConfig config,
@@ -56,6 +60,24 @@ public class ProfileScheduler : BackgroundService
                 _config.LoadThrottling.CheckTiming);
         }
 
+        // Check if any profiles have RunImmediatelyOnStart and we have a startup delay
+        var hasImmediateProfiles = _config.Profiles.Any(p =>
+            p.Schedule.Enabled && p.Schedule.RunImmediatelyOnStart);
+
+        if (_config.StartupDelaySeconds > 0 && hasImmediateProfiles)
+        {
+            _startupDelayEndTime = DateTime.UtcNow.AddSeconds(_config.StartupDelaySeconds);
+            _startupDelayCompleted = false;
+            _logger.LogInformation(
+                "Startup delay enabled: {Seconds} seconds until auto-sync begins. " +
+                "Use dashboard or API to start earlier or trigger specific tables.",
+                _config.StartupDelaySeconds);
+        }
+        else
+        {
+            _startupDelayCompleted = true;
+        }
+
         // Initialize profile states - maintain order for sequential mode
         var profileIndex = 0;
         foreach (var profile in _config.Profiles)
@@ -64,9 +86,15 @@ public class ProfileScheduler : BackgroundService
 
             if (profile.Schedule.Enabled)
             {
-                nextRun = profile.Schedule.RunImmediatelyOnStart
-                    ? DateTime.UtcNow
-                    : profile.Schedule.GetNextRunTime(DateTime.UtcNow);
+                if (profile.Schedule.RunImmediatelyOnStart)
+                {
+                    // If startup delay is active, set next run to after the delay
+                    nextRun = _startupDelayEndTime ?? DateTime.UtcNow;
+                }
+                else
+                {
+                    nextRun = profile.Schedule.GetNextRunTime(DateTime.UtcNow);
+                }
             }
 
             _profileStates[profile.ProfileName] = new ProfileState
@@ -95,6 +123,13 @@ public class ProfileScheduler : BackgroundService
         {
             var now = DateTime.UtcNow;
             var localNow = now.ToLocalTime();
+
+            // Check if startup delay has expired
+            if (!_startupDelayCompleted && _startupDelayEndTime.HasValue && now >= _startupDelayEndTime.Value)
+            {
+                _startupDelayCompleted = true;
+                _logger.LogInformation("Startup delay completed - automatic syncs will now begin");
+            }
 
             // Check blackout window
             var isInBlackout = _config.BlackoutWindow?.IsInBlackoutWindow(localNow) == true;
@@ -223,7 +258,9 @@ public class ProfileScheduler : BackgroundService
                 _logger.LogInformation("═══ Starting scheduled sync for profile '{Name}' ═══", profile.ProfileName);
             }
 
-            var orchestrator = CreateOrchestrator(profile, state);
+            // Get estimated row counts from sync history for progress tracking
+            var estimatedRows = await GetEstimatedRowsAsync(profile);
+            var orchestrator = CreateOrchestrator(profile, state, estimatedRows);
 
             await orchestrator.InitializeAsync();
             var result = await orchestrator.SyncAllAsync(forceFullRefresh,
@@ -263,18 +300,40 @@ public class ProfileScheduler : BackgroundService
         }
     }
 
-    private SyncOrchestrator CreateOrchestrator(SyncProfile profile, ProfileState? state = null)
+    private SyncOrchestrator CreateOrchestrator(SyncProfile profile, ProfileState? state = null, Dictionary<string, long>? estimatedRows = null)
     {
         // Create callback to track active tables if state is provided
         Action<string, bool>? tableStatusCallback = null;
+        Action<string, long, string>? progressCallback = null;
+
         if (state != null)
         {
             tableStatusCallback = (tableName, isStarting) =>
             {
                 if (isStarting)
-                    state.CurrentTables.TryAdd(tableName, 0);
+                {
+                    var estimated = estimatedRows?.GetValueOrDefault(tableName, 0) ?? 0;
+                    state.CurrentTables.TryAdd(tableName, new TableSyncProgress
+                    {
+                        TableName = tableName,
+                        StartTime = DateTime.UtcNow,
+                        EstimatedTotalRows = estimated,
+                        Phase = "Loading"
+                    });
+                }
                 else
+                {
                     state.CurrentTables.TryRemove(tableName, out _);
+                }
+            };
+
+            progressCallback = (tableName, rowsProcessed, phase) =>
+            {
+                if (state.CurrentTables.TryGetValue(tableName, out var progress))
+                {
+                    progress.RowsProcessed = rowsProcessed;
+                    progress.Phase = phase;
+                }
             };
         }
 
@@ -290,7 +349,8 @@ public class ProfileScheduler : BackgroundService
             _loggerFactory.CreateLogger<PostgreSqlToSqlServerBulkCopier>(),
             _loggerFactory.CreateLogger<PostgreSqlSyncHistoryRepository>(),
             _loggerFactory.CreateLogger<SqlServerSyncHistoryRepository>(),
-            tableStatusCallback);
+            tableStatusCallback,
+            progressCallback);
     }
 
     /// <summary>
@@ -347,6 +407,41 @@ public class ProfileScheduler : BackgroundService
     }
 
     /// <summary>
+    /// Manually trigger sync for a specific table in a profile
+    /// </summary>
+    public async Task<SyncResult> TriggerTableAsync(string profileName, string tableName, bool fullRefresh = false)
+    {
+        var profile = _config.Profiles.FirstOrDefault(p =>
+            p.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+
+        if (profile == null)
+        {
+            throw new ArgumentException($"Profile '{profileName}' not found");
+        }
+
+        var tableConfig = profile.Tables.FirstOrDefault(t =>
+            t.SourceTable.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+
+        if (tableConfig == null)
+        {
+            throw new ArgumentException($"Table '{tableName}' not found in profile '{profileName}'");
+        }
+
+        if (_profileStates.TryGetValue(profile.ProfileName, out var state) && state.IsRunning)
+        {
+            throw new InvalidOperationException($"Profile '{profileName}' is already running");
+        }
+
+        _logger.LogInformation("Manual trigger for table '{Table}' in profile '{Profile}' (fullRefresh: {FullRefresh})",
+            tableName, profileName, fullRefresh);
+
+        var orchestrator = CreateOrchestrator(profile);
+
+        await orchestrator.InitializeAsync();
+        return await orchestrator.SyncTableAsync(tableConfig, fullRefresh);
+    }
+
+    /// <summary>
     /// Get current status of all profiles
     /// </summary>
     public IEnumerable<ProfileStatusInfo> GetAllProfileStatus()
@@ -364,7 +459,14 @@ public class ProfileScheduler : BackgroundService
             IntervalMinutes = s.Profile.Schedule.IntervalMinutes,
             ScheduleDescription = s.Profile.Schedule.GetDescription(_config.BlackoutWindow),
             TableCount = s.Profile.Tables.Count,
-            CurrentTables = s.CurrentTables.Keys.ToList(),
+            CurrentTableProgress = s.CurrentTables.Values.Select(p => new TableSyncProgressInfo
+            {
+                TableName = p.TableName,
+                RowsProcessed = p.RowsProcessed,
+                EstimatedTotalRows = p.EstimatedTotalRows,
+                StartTime = p.StartTime,
+                Phase = p.Phase
+            }).ToList(),
             CurrentRunStartTime = s.CurrentRunStartTime
         });
     }
@@ -397,7 +499,14 @@ public class ProfileScheduler : BackgroundService
             IntervalMinutes = state.Profile.Schedule.IntervalMinutes,
             ScheduleDescription = state.Profile.Schedule.GetDescription(_config.BlackoutWindow),
             TableCount = state.Profile.Tables.Count,
-            CurrentTables = state.CurrentTables.Keys.ToList(),
+            CurrentTableProgress = state.CurrentTables.Values.Select(p => new TableSyncProgressInfo
+            {
+                TableName = p.TableName,
+                RowsProcessed = p.RowsProcessed,
+                EstimatedTotalRows = p.EstimatedTotalRows,
+                StartTime = p.StartTime,
+                Phase = p.Phase
+            }).ToList(),
             CurrentRunStartTime = state.CurrentRunStartTime
         };
     }
@@ -441,7 +550,43 @@ public class ProfileScheduler : BackgroundService
         // Ensure schema is up to date (adds any missing columns)
         await historyRepo.InitializeAsync();
 
-        return await historyRepo.GetRecentHistoryAsync(profile.ProfileName, limit);
+        return await historyRepo.GetRecentHistoryAsync(profile.EffectiveProfileId, limit);
+    }
+
+    /// <summary>
+    /// Get estimated row counts from sync history for progress tracking
+    /// Uses TotalSourceRows from the most recent successful sync for each table
+    /// </summary>
+    private async Task<Dictionary<string, long>> GetEstimatedRowsAsync(SyncProfile profile)
+    {
+        var result = new Dictionary<string, long>();
+
+        try
+        {
+            // Get recent history for the profile (limit to recent entries)
+            var history = await GetSyncHistoryAsync(profile.ProfileName, 100);
+
+            // Group by table and take the most recent successful sync's TotalSourceRows
+            foreach (var tableGroup in history.Where(h => h.Success && h.TotalSourceRows > 0)
+                                              .GroupBy(h => h.SourceTable))
+            {
+                var mostRecent = tableGroup.OrderByDescending(h => h.SyncEndTime).First();
+                result[mostRecent.SourceTable] = mostRecent.TotalSourceRows;
+            }
+
+            if (result.Count > 0)
+            {
+                _logger.LogDebug(
+                    "Loaded estimated row counts from history for {Count} tables",
+                    result.Count);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to load estimated row counts from history");
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -451,6 +596,55 @@ public class ProfileScheduler : BackgroundService
     {
         return _config.Profiles.FirstOrDefault(p =>
             p.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase));
+    }
+
+    /// <summary>
+    /// Get startup delay status
+    /// </summary>
+    public StartupDelayStatus GetStartupDelayStatus()
+    {
+        if (_startupDelayCompleted || !_startupDelayEndTime.HasValue)
+        {
+            return new StartupDelayStatus
+            {
+                IsActive = false,
+                SecondsRemaining = 0,
+                EndTime = null
+            };
+        }
+
+        var remaining = (_startupDelayEndTime.Value - DateTime.UtcNow).TotalSeconds;
+        return new StartupDelayStatus
+        {
+            IsActive = remaining > 0,
+            SecondsRemaining = Math.Max(0, (int)remaining),
+            EndTime = _startupDelayEndTime.Value
+        };
+    }
+
+    /// <summary>
+    /// Cancel the startup delay and allow syncs to start immediately
+    /// </summary>
+    public void CancelStartupDelay()
+    {
+        if (_startupDelayCompleted)
+            return;
+
+        _logger.LogInformation("Startup delay cancelled via API - syncs will now begin");
+        _startupDelayCompleted = true;
+        _startupDelayEndTime = DateTime.UtcNow;
+
+        // Update all profiles that were waiting for the delay to end
+        foreach (var state in _profileStates.Values)
+        {
+            if (state.Profile.Schedule.Enabled &&
+                state.Profile.Schedule.RunImmediatelyOnStart &&
+                state.NextRunTime.HasValue &&
+                state.NextRunTime.Value > DateTime.UtcNow)
+            {
+                state.NextRunTime = DateTime.UtcNow;
+            }
+        }
     }
 
     /// <summary>
@@ -493,12 +687,45 @@ internal class ProfileState
     public int ProfileIndex { get; set; }
 
     /// <summary>
-    /// Thread-safe set of tables currently being synced
+    /// Thread-safe dictionary of tables currently being synced with progress
     /// </summary>
-    public ConcurrentDictionary<string, byte> CurrentTables { get; } = new();
+    public ConcurrentDictionary<string, TableSyncProgress> CurrentTables { get; } = new();
 
     /// <summary>
     /// When the current sync run started
     /// </summary>
     public DateTime? CurrentRunStartTime { get; set; }
+}
+
+/// <summary>
+/// Progress tracking for a table sync operation
+/// </summary>
+public class TableSyncProgress
+{
+    public string TableName { get; set; } = string.Empty;
+    public long RowsProcessed { get; set; }
+    public long EstimatedTotalRows { get; set; }
+    public DateTime StartTime { get; set; }
+    public string Phase { get; set; } = "Loading";
+}
+
+/// <summary>
+/// Status of the startup delay
+/// </summary>
+public class StartupDelayStatus
+{
+    /// <summary>
+    /// Whether the startup delay is currently active
+    /// </summary>
+    public bool IsActive { get; set; }
+
+    /// <summary>
+    /// Seconds remaining until syncs begin
+    /// </summary>
+    public int SecondsRemaining { get; set; }
+
+    /// <summary>
+    /// When the delay will end (UTC)
+    /// </summary>
+    public DateTime? EndTime { get; set; }
 }

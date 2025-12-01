@@ -78,4 +78,14 @@ public interface ISyncHistoryRepository
     /// Get recent sync history across all tables for a profile
     /// </summary>
     Task<List<SyncHistory>> GetRecentHistoryAsync(string profileName, int limit = 50);
+
+    /// <summary>
+    /// Rename a profile in sync history (migrate old records to new profile ID)
+    /// </summary>
+    Task<int> RenameProfileAsync(string oldProfileName, string newProfileName);
+
+    /// <summary>
+    /// Get distinct profile names from sync history
+    /// </summary>
+    Task<List<string>> GetProfileNamesFromHistoryAsync();
 }

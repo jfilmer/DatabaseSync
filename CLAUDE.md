@@ -166,6 +166,8 @@ A high-performance, standalone database synchronization service that supports **
 | Load-based throttling | Pause sync when source server CPU is high |
 | Auto-create target tables | CreateIfMissing option |
 | Source data filtering | SourceFilter WHERE clause |
+| Single-instance enforcement | File lock prevents multiple instances from running |
+| Batched MERGE for large tables | SQL Server targets batch MERGE in 1M row chunks for tables >1M rows |
 
 ---
 
@@ -680,4 +682,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added dashboard documentation; fixed Recent % calculation to use RowsUpdated instead of RowsProcessed*
+*Last Updated: Added single-instance enforcement via file lock; added batched MERGE for large tables (>1M rows) on SQL Server targets*

@@ -126,12 +126,36 @@ public class ProfileStatusInfo
     public int TableCount { get; set; }
 
     /// <summary>
-    /// List of tables currently being synced (when IsRunning is true)
+    /// Progress details for tables currently being synced (when IsRunning is true)
     /// </summary>
-    public List<string> CurrentTables { get; set; } = new();
+    public List<TableSyncProgressInfo> CurrentTableProgress { get; set; } = new();
 
     /// <summary>
     /// When the current sync run started (when IsRunning is true)
     /// </summary>
     public DateTime? CurrentRunStartTime { get; set; }
+}
+
+/// <summary>
+/// Progress information for a table sync operation (for display purposes)
+/// </summary>
+public class TableSyncProgressInfo
+{
+    public string TableName { get; set; } = string.Empty;
+    public long RowsProcessed { get; set; }
+    public long EstimatedTotalRows { get; set; }
+    public DateTime StartTime { get; set; }
+    public string Phase { get; set; } = "Loading"; // Loading, Upserting, Deleting
+
+    /// <summary>
+    /// Progress percentage (0-100), or -1 if unknown
+    /// </summary>
+    public int ProgressPercent => EstimatedTotalRows > 0
+        ? (int)Math.Min(100, RowsProcessed * 100 / EstimatedTotalRows)
+        : -1;
+
+    /// <summary>
+    /// Elapsed time since sync started
+    /// </summary>
+    public TimeSpan Elapsed => DateTime.UtcNow - StartTime;
 }

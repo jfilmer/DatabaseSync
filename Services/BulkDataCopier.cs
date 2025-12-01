@@ -21,6 +21,12 @@ public class BulkDataCopier
     private readonly ILogger<BulkDataCopier> _logger;
     private readonly int _commandTimeout;
 
+    /// <summary>
+    /// Optional callback for progress updates (rowsProcessed)
+    /// Called every 100,000 rows during bulk load
+    /// </summary>
+    public Action<long>? ProgressCallback { get; set; }
+
     public BulkDataCopier(
         string sourceConnectionString,
         string targetConnectionString,
@@ -305,6 +311,7 @@ public class BulkDataCopier
             if (rowsLoaded % 100000 == 0)
             {
                 _logger.LogDebug("Loaded {Rows:N0} rows to staging...", rowsLoaded);
+                ProgressCallback?.Invoke(rowsLoaded);
             }
         }
 

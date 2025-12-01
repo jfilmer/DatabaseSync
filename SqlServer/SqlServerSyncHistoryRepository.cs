@@ -278,4 +278,39 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
 
         return deleted;
     }
+
+    /// <summary>
+    /// Rename a profile in sync history (migrate old records to new profile ID)
+    /// </summary>
+    public async Task<int> RenameProfileAsync(string oldProfileName, string newProfileName)
+    {
+        var sql = $@"
+            UPDATE [{TableName}]
+            SET profile_name = @newProfileName
+            WHERE profile_name = @oldProfileName";
+
+        await using var connection = new SqlConnection(_connectionString);
+        var updated = await connection.ExecuteAsync(sql, new { oldProfileName, newProfileName });
+
+        _logger.LogInformation(
+            "Renamed profile '{OldName}' to '{NewName}' in {Count} history records",
+            oldProfileName, newProfileName, updated);
+
+        return updated;
+    }
+
+    /// <summary>
+    /// Get distinct profile names from sync history
+    /// </summary>
+    public async Task<List<string>> GetProfileNamesFromHistoryAsync()
+    {
+        var sql = $@"
+            SELECT DISTINCT profile_name
+            FROM [{TableName}]
+            ORDER BY profile_name";
+
+        await using var connection = new SqlConnection(_connectionString);
+        var results = await connection.QueryAsync<string>(sql);
+        return results.ToList();
+    }
 }

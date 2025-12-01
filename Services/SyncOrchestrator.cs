@@ -36,6 +36,8 @@ public class SyncOrchestrator
 
     // Optional callback for tracking active tables
     private readonly Action<string, bool>? _tableStatusCallback;
+    // Optional callback for progress updates (tableName, rowsProcessed, phase)
+    private readonly Action<string, long, string>? _progressCallback;
 
     public SyncOrchestrator(
         SyncProfile profile,
@@ -49,11 +51,13 @@ public class SyncOrchestrator
         ILogger<PostgreSqlToSqlServerBulkCopier> pgToSqlCopierLogger,
         ILogger<PostgreSqlSyncHistoryRepository> pgHistoryLogger,
         ILogger<SqlServerSyncHistoryRepository> sqlHistoryLogger,
-        Action<string, bool>? tableStatusCallback = null)
+        Action<string, bool>? tableStatusCallback = null,
+        Action<string, long, string>? progressCallback = null)
     {
         _profile = profile;
         _logger = logger;
         _tableStatusCallback = tableStatusCallback;
+        _progressCallback = progressCallback;
         _runId = Guid.NewGuid();
         _typeMapper = new TypeMapper();
         _sourceDatabaseType = profile.SourceConnection.DatabaseType;
@@ -286,7 +290,7 @@ public class SyncOrchestrator
                 _historyRepository != null)
             {
                 var lastSync = await _historyRepository.GetLastSyncInfoAsync(
-                    _profile.ProfileName, tableConfig.SourceTable);
+                    _profile.EffectiveProfileId, tableConfig.SourceTable);
 
                 if (lastSync?.MaxSourceTimestamp != null)
                 {
@@ -333,6 +337,9 @@ public class SyncOrchestrator
             // Get the source table name with correct casing for the source database
             var sourceTableName = GetEffectiveSourceTableName(tableConfig);
 
+            // Set up progress callback on the appropriate copier
+            SetupProgressCallback(tableConfig.SourceTable);
+
             if (effectiveMode == SyncMode.FullRefresh)
             {
                 copyResult = await ExecuteBulkUpsertAsync(sourceTableName, targetTableName, filteredColumns, tableConfig);
@@ -358,12 +365,18 @@ public class SyncOrchestrator
             result.RowsDeleted = copyResult.RowsDeleted;
             result.RecentRowsCount = copyResult.RecentRowsCount;
             result.Success = true;
+
+            // Report final progress
+            _progressCallback?.Invoke(tableConfig.SourceTable, copyResult.RowsProcessed, "Complete");
         }
         catch (Exception ex)
         {
             result.Success = false;
             result.Error = ex.Message;
             _logger.LogError(ex, "Sync failed for {Table}", tableConfig.SourceTable);
+
+            // Report error status
+            _progressCallback?.Invoke(tableConfig.SourceTable, 0, "Error");
         }
 
         RecordHistory:
@@ -407,7 +420,7 @@ public class SyncOrchestrator
             await _historyRepository.RecordSyncAsync(new SyncHistory
             {
                 RunId = _runId,
-                ProfileName = _profile.ProfileName,
+                ProfileName = _profile.EffectiveProfileId,
                 SourceTable = tableConfig.SourceTable,
                 TargetTable = GetEffectiveTargetTableName(tableConfig),
                 SyncStartTime = syncStartTime,
@@ -780,7 +793,30 @@ CREATE TABLE [{tableName}] (
         if (_historyRepository == null)
             return new Dictionary<string, LastSyncInfo>();
 
-        return await _historyRepository.GetAllLastSyncInfoAsync(_profile.ProfileName);
+        return await _historyRepository.GetAllLastSyncInfoAsync(_profile.EffectiveProfileId);
+    }
+
+    /// <summary>
+    /// Set up the progress callback on the appropriate bulk copier
+    /// </summary>
+    private void SetupProgressCallback(string tableName)
+    {
+        if (_progressCallback == null)
+            return;
+
+        // Create a callback that wraps the orchestrator's progress callback
+        Action<long>? copierCallback = rowsProcessed =>
+            _progressCallback(tableName, rowsProcessed, "Loading");
+
+        // Set on the appropriate copier
+        if (_sqlServerToPostgreSqlCopier != null)
+            _sqlServerToPostgreSqlCopier.ProgressCallback = copierCallback;
+        else if (_sqlServerToSqlServerCopier != null)
+            _sqlServerToSqlServerCopier.ProgressCallback = copierCallback;
+        else if (_postgreSqlToPostgreSqlCopier != null)
+            _postgreSqlToPostgreSqlCopier.ProgressCallback = copierCallback;
+        else if (_postgreSqlToSqlServerCopier != null)
+            _postgreSqlToSqlServerCopier.ProgressCallback = copierCallback;
     }
 
     /// <summary>

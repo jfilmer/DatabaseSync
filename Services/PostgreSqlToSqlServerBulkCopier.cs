@@ -22,6 +22,12 @@ public class PostgreSqlToSqlServerBulkCopier
     private readonly ILogger<PostgreSqlToSqlServerBulkCopier> _logger;
     private readonly int _commandTimeout;
 
+    /// <summary>
+    /// Optional callback for progress updates (rowsProcessed)
+    /// Called every 100,000 rows during bulk load
+    /// </summary>
+    public Action<long>? ProgressCallback { get; set; }
+
     public PostgreSqlToSqlServerBulkCopier(
         string sourceConnectionString,
         string targetConnectionString,
@@ -288,6 +294,7 @@ public class PostgreSqlToSqlServerBulkCopier
             {
                 await BulkInsertDataTableAsync(targetConn, stagingTableName, dataTable, columns);
                 _logger.LogDebug("Loaded {Rows:N0} rows to staging...", rowsLoaded);
+                ProgressCallback?.Invoke(rowsLoaded);
                 dataTable.Clear();
             }
         }
