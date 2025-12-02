@@ -370,6 +370,8 @@ public class ScheduleConfig
 
     private DateTime GetNextRunTimeFromDaySchedules(DateTime fromTime)
     {
+        // Convert to local time for schedule calculations since StartTime is in local time
+        var localFromTime = fromTime.Kind == DateTimeKind.Utc ? fromTime.ToLocalTime() : fromTime;
         DateTime? earliestNextRun = null;
 
         // Check each day schedule
@@ -389,21 +391,21 @@ public class ScheduleConfig
             {
                 var dayNum = (int)day;
                 // Find the next occurrence of this day
-                var daysUntil = ((dayNum - (int)fromTime.DayOfWeek) + 7) % 7;
-                var targetDate = fromTime.Date.AddDays(daysUntil);
+                var daysUntil = ((dayNum - (int)localFromTime.DayOfWeek) + 7) % 7;
+                var targetDate = localFromTime.Date.AddDays(daysUntil);
                 var dayStart = targetDate.AddHours(startHour).AddMinutes(startMinute);
 
                 DateTime nextRun;
 
                 if (daysUntil == 0) // Today
                 {
-                    if (dayStart > fromTime)
+                    if (dayStart > localFromTime)
                     {
                         nextRun = dayStart;
                     }
                     else
                     {
-                        var minutesSinceStart = (fromTime - dayStart).TotalMinutes;
+                        var minutesSinceStart = (localFromTime - dayStart).TotalMinutes;
                         var intervalsPassed = (int)Math.Floor(minutesSinceStart / interval);
                         nextRun = dayStart.AddMinutes((intervalsPassed + 1) * interval);
 
@@ -427,22 +429,27 @@ public class ScheduleConfig
             }
         }
 
-        return earliestNextRun ?? GetNextRunTimeLegacy(fromTime);
+        // Convert back to UTC for storage/comparison (the result is in local time)
+        var result = earliestNextRun ?? GetNextRunTimeLegacy(fromTime);
+        return result.Kind == DateTimeKind.Utc ? result : result.ToUniversalTime();
     }
 
     private DateTime GetNextRunTimeLegacy(DateTime fromTime)
     {
+        // Convert to local time for schedule calculations since StartTime is in local time
+        var localFromTime = fromTime.Kind == DateTimeKind.Utc ? fromTime.ToLocalTime() : fromTime;
+
         // Parse start time
         var parts = StartTime.Split(':');
         var startHour = int.Parse(parts[0]);
         var startMinute = parts.Length > 1 ? int.Parse(parts[1]) : 0;
 
-        // Get today's start time
-        var todayStart = fromTime.Date.AddHours(startHour).AddMinutes(startMinute);
+        // Get today's start time (in local time)
+        var todayStart = localFromTime.Date.AddHours(startHour).AddMinutes(startMinute);
 
         DateTime nextRun;
 
-        if (todayStart > fromTime)
+        if (todayStart > localFromTime)
         {
             // Start time hasn't occurred yet today
             nextRun = todayStart;
@@ -450,7 +457,7 @@ public class ScheduleConfig
         else
         {
             // Calculate intervals since start time
-            var minutesSinceStart = (fromTime - todayStart).TotalMinutes;
+            var minutesSinceStart = (localFromTime - todayStart).TotalMinutes;
             var intervalsPassed = (int)Math.Floor(minutesSinceStart / IntervalMinutes);
             nextRun = todayStart.AddMinutes((intervalsPassed + 1) * IntervalMinutes);
         }
@@ -464,7 +471,8 @@ public class ScheduleConfig
             }
         }
 
-        return nextRun;
+        // Convert back to UTC for storage/comparison
+        return nextRun.ToUniversalTime();
     }
 
     /// <summary>
