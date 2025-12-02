@@ -25,6 +25,14 @@ public class PostgreSqlBulkDataCopier
     /// </summary>
     public Action<long>? ProgressCallback { get; set; }
 
+    /// <summary>
+    /// Batch size for reading rows from source database.
+    /// When set > 0, source data is read in batches using LIMIT/OFFSET.
+    /// Set to 0 to disable batching.
+    /// Default: 100000 (100K rows per batch)
+    /// </summary>
+    public int SourceBatchSize { get; set; } = 100000;
+
     public PostgreSqlBulkDataCopier(
         string sourceConnectionString,
         string targetConnectionString,

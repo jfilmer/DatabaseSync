@@ -126,7 +126,11 @@ public class SyncOrchestrator
                     profile.TargetConnection.ConnectionString,
                     _typeMapper,
                     sqlToPgCopierLogger,
-                    profile.Options.CommandTimeoutSeconds);
+                    profile.Options.CommandTimeoutSeconds)
+                {
+                    UseNoLock = profile.Options.UseNoLock,
+                    SourceBatchSize = profile.Options.SourceBatchSize
+                };
                 break;
 
             case (DatabaseType.SqlServer, DatabaseType.SqlServer):
@@ -134,7 +138,11 @@ public class SyncOrchestrator
                     profile.SourceConnection.ConnectionString,
                     profile.TargetConnection.ConnectionString,
                     sqlToSqlCopierLogger,
-                    profile.Options.CommandTimeoutSeconds);
+                    profile.Options.CommandTimeoutSeconds)
+                {
+                    UseNoLock = profile.Options.UseNoLock,
+                    SourceBatchSize = profile.Options.SourceBatchSize
+                };
                 break;
 
             case (DatabaseType.PostgreSql, DatabaseType.PostgreSql):
@@ -142,7 +150,10 @@ public class SyncOrchestrator
                     profile.SourceConnection.ConnectionString,
                     profile.TargetConnection.ConnectionString,
                     pgToPgCopierLogger,
-                    profile.Options.CommandTimeoutSeconds);
+                    profile.Options.CommandTimeoutSeconds)
+                {
+                    SourceBatchSize = profile.Options.SourceBatchSize
+                };
                 break;
 
             case (DatabaseType.PostgreSql, DatabaseType.SqlServer):
@@ -150,7 +161,10 @@ public class SyncOrchestrator
                     profile.SourceConnection.ConnectionString,
                     profile.TargetConnection.ConnectionString,
                     pgToSqlCopierLogger,
-                    profile.Options.CommandTimeoutSeconds);
+                    profile.Options.CommandTimeoutSeconds)
+                {
+                    SourceBatchSize = profile.Options.SourceBatchSize
+                };
                 break;
 
             default:

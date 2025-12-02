@@ -33,6 +33,20 @@ public class SqlServerBulkDataCopier
     /// </summary>
     public Action<long>? ProgressCallback { get; set; }
 
+    /// <summary>
+    /// Use WITH (NOLOCK) hint on SQL Server source queries to reduce blocking.
+    /// Default: true
+    /// </summary>
+    public bool UseNoLock { get; set; } = true;
+
+    /// <summary>
+    /// Batch size for reading rows from source database.
+    /// When set > 0, source data is read in batches using OFFSET/FETCH.
+    /// Set to 0 to disable batching.
+    /// Default: 100000 (100K rows per batch)
+    /// </summary>
+    public int SourceBatchSize { get; set; } = 100000;
+
     public SqlServerBulkDataCopier(
         string sourceConnectionString,
         string targetConnectionString,
@@ -98,7 +112,8 @@ public class SqlServerBulkDataCopier
                 IsSpatialType(c.DataType)
                     ? $"CAST([{c.ColumnName}] AS varbinary(MAX)) AS [{c.ColumnName}]"
                     : $"[{c.ColumnName}]"));
-            var sourceQuery = $"SELECT {sourceColumnList} FROM [{sourceTableName}]";
+            var noLockHint = UseNoLock ? " WITH (NOLOCK)" : "";
+            var sourceQuery = $"SELECT {sourceColumnList} FROM [{sourceTableName}]{noLockHint}";
 
             if (!string.IsNullOrEmpty(config.SourceFilter))
             {
@@ -106,7 +121,8 @@ public class SqlServerBulkDataCopier
             }
 
             // Bulk load to staging using SqlBulkCopy
-            _logger.LogInformation("Loading data from source SQL Server to staging table...");
+            _logger.LogInformation("Loading data from source SQL Server to staging table{NoLock}...",
+                UseNoLock ? " (NOLOCK)" : "");
 
             result.RowsProcessed = await BulkLoadToStagingAsync(
                 sourceConn, targetConn, sourceQuery, stagingTableName, allColumns);
@@ -208,6 +224,7 @@ public class SqlServerBulkDataCopier
                 IsSpatialType(c.DataType)
                     ? $"CAST([{c.ColumnName}] AS varbinary(MAX)) AS [{c.ColumnName}]"
                     : $"[{c.ColumnName}]"));
+            var noLockHint = UseNoLock ? " WITH (NOLOCK)" : "";
 
             // Use COALESCE if FallbackTimestampColumn is specified
             string timestampExpression;
@@ -227,9 +244,10 @@ public class SqlServerBulkDataCopier
                 whereClause += $" AND ({config.SourceFilter})";
             }
 
-            var sourceQuery = $"SELECT {sourceColumnList} FROM [{sourceTableName}] WHERE {whereClause}";
+            var sourceQuery = $"SELECT {sourceColumnList} FROM [{sourceTableName}]{noLockHint} WHERE {whereClause}";
 
-            _logger.LogInformation("Loading rows changed since {LastSync}...", lastSyncTime);
+            _logger.LogInformation("Loading rows changed since {LastSync}{NoLock}...",
+                lastSyncTime, UseNoLock ? " (NOLOCK)" : "");
 
             result.RowsProcessed = await BulkLoadToStagingAsync(
                 sourceConn, targetConn, sourceQuery, stagingTableName, allColumns,

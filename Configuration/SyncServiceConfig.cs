@@ -652,26 +652,44 @@ public class ProfileOptions
     /// Maximum number of tables to sync in parallel
     /// </summary>
     public int MaxParallelTables { get; set; } = 4;
-    
+
     /// <summary>
     /// Database command timeout in seconds
     /// </summary>
     public int CommandTimeoutSeconds { get; set; } = 3600;
-    
+
     /// <summary>
     /// Track sync history in the _sync_history table
     /// </summary>
     public bool EnableSyncHistory { get; set; } = true;
-    
+
     /// <summary>
     /// Automatically use last sync time from history for incremental syncs
     /// </summary>
     public bool UseHistoryForIncrementalSync { get; set; } = true;
-    
+
     /// <summary>
     /// Stop syncing remaining tables if any table fails
     /// </summary>
     public bool StopOnError { get; set; } = false;
+
+    /// <summary>
+    /// Use WITH (NOLOCK) hint on SQL Server source queries to reduce blocking.
+    /// This allows reading uncommitted data (dirty reads) but significantly reduces
+    /// lock contention on the source database. Recommended for read-heavy sync operations
+    /// where occasional dirty reads are acceptable.
+    /// Default: true (enabled for better production database performance)
+    /// </summary>
+    public bool UseNoLock { get; set; } = true;
+
+    /// <summary>
+    /// Batch size for reading rows from source database.
+    /// When set > 0, source data is read in batches of this size instead of streaming all rows.
+    /// This reduces memory pressure on the source database and allows other queries to interleave.
+    /// Set to 0 to disable batching (stream all rows in a single query).
+    /// Default: 100000 (100K rows per batch)
+    /// </summary>
+    public int SourceBatchSize { get; set; } = 100000;
 }
 
 /// <summary>

@@ -192,6 +192,8 @@ A high-performance, standalone database synchronization service that supports **
 | Source data filtering | SourceFilter WHERE clause |
 | Single-instance enforcement | File lock prevents multiple instances from running |
 | Batched MERGE for large tables | SQL Server targets batch MERGE in 1M row chunks for tables >1M rows |
+| NOLOCK hints (SQL Server) | Reduce blocking on source database with WITH (NOLOCK) |
+| Source row batching | Read source data in batches to reduce memory pressure |
 
 ---
 
@@ -234,7 +236,9 @@ SyncService
 │   │   ├── CommandTimeoutSeconds
 │   │   ├── EnableSyncHistory
 │   │   ├── UseHistoryForIncrementalSync
-│   │   └── StopOnError
+│   │   ├── StopOnError
+│   │   ├── UseNoLock (default: true - SQL Server sources only)
+│   │   └── SourceBatchSize (default: 100000)
 │   └── Tables[]
 │       ├── SourceTable
 │       ├── TargetTable
@@ -262,6 +266,8 @@ SyncService
 | `EnableSyncHistory` | `true` | Track sync results in `_sync_history` table | Disable only if you don't need history/incremental sync |
 | `UseHistoryForIncrementalSync` | `true` | Use `_sync_history` to find last sync time | Should almost always be `true` for incremental mode |
 | `StopOnError` | `false` | Stop entire profile if one table fails | Set `true` when tables have dependencies |
+| `UseNoLock` | `true` | Use WITH (NOLOCK) on SQL Server source queries | Set `false` if you need guaranteed consistency (rare) |
+| `SourceBatchSize` | `100000` | Rows to read per batch from source | Decrease to reduce source DB memory pressure; set to 0 to disable batching |
 
 ### Table Options
 
@@ -437,6 +443,55 @@ Pause sync when source database is under heavy load:
 **How it works:**
 - **SQL Server**: Queries `sys.dm_os_ring_buffers` for CPU utilization (requires `VIEW SERVER STATE` permission)
 - **PostgreSQL**: Queries `pg_stat_activity` for active connection count
+
+---
+
+## Source Database Performance
+
+Two options help reduce impact on production source databases:
+
+### NOLOCK Hint (SQL Server sources)
+
+When `UseNoLock: true` (default), all SQL Server source queries use `WITH (NOLOCK)`:
+- Reduces lock contention on source database
+- Allows other queries to proceed without blocking
+- May read uncommitted data (dirty reads) - acceptable for sync operations
+
+```json
+{
+  "Options": {
+    "UseNoLock": true
+  }
+}
+```
+
+### Source Batching
+
+When `SourceBatchSize > 0` (default: 100000), source data is read in batches:
+- Reduces memory pressure on source database server
+- Allows other queries to interleave between batches
+- Progress logged every batch
+
+```json
+{
+  "Options": {
+    "SourceBatchSize": 50000
+  }
+}
+```
+
+Set to `0` to disable batching (stream all rows in single query).
+
+**Recommended settings for busy production databases:**
+```json
+{
+  "Options": {
+    "UseNoLock": true,
+    "SourceBatchSize": 50000,
+    "MaxParallelTables": 2
+  }
+}
+```
 
 ---
 
