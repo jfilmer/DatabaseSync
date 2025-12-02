@@ -40,17 +40,40 @@ curl http://localhost:5123/status
 
 ### Deploy as Service
 
+**Windows (Recommended)**:
+
+The application has native Windows Service support built-in.
+
+```cmd
+# 1. Publish as self-contained executable
+dotnet publish -c Release -r win-x64 --self-contained true -o C:\Services\DatabaseSync
+
+# 2. Copy your appsettings.json to the publish folder
+copy appsettings.json C:\Services\DatabaseSync\
+
+# 3. Install as Windows Service (run as Administrator)
+sc create DatabaseSync binPath="C:\Services\DatabaseSync\DatabaseSync.exe" start=auto DisplayName="Database Sync Service"
+
+# 4. Configure automatic restart on failure
+sc failure DatabaseSync reset=86400 actions=restart/60000/restart/60000/restart/60000
+
+# 5. Start the service
+sc start DatabaseSync
+```
+
+**Windows Service Management**:
+```cmd
+sc stop DatabaseSync      # Stop the service
+sc start DatabaseSync     # Start the service
+sc query DatabaseSync     # Check status
+sc delete DatabaseSync    # Uninstall (stop first)
+```
+
 **Linux (systemd)**:
 ```bash
 sudo cp database-sync.service /etc/systemd/system/
 sudo systemctl enable database-sync
 sudo systemctl start database-sync
-```
-
-**Windows**:
-```cmd
-sc create DatabaseSync binPath="C:\Apps\DatabaseSync\DatabaseSync.exe" start=auto
-sc start DatabaseSync
 ```
 
 ---
@@ -90,6 +113,7 @@ A high-performance, standalone database synchronization service that supports **
 {
   "SyncService": {
     "HttpPort": 5123,
+    "LogPath": "D:/Logs/DatabaseSync",
     "Profiles": [
       {
         "ProfileName": "my-sync",
@@ -176,6 +200,7 @@ A high-performance, standalone database synchronization service that supports **
 ```
 SyncService
 ├── HttpPort
+├── LogPath (default: "logs", can be absolute path like "D:/Logs/DatabaseSync")
 ├── ProfileExecutionMode (Parallel/Sequential)
 ├── BlackoutWindow
 │   ├── Enabled

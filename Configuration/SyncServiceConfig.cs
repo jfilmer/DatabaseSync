@@ -23,6 +23,14 @@ public class SyncServiceConfig
     public string LogLevel { get; set; } = "Information";
 
     /// <summary>
+    /// Path for log files. Can be absolute or relative to the application directory.
+    /// Use forward slashes for cross-platform compatibility.
+    /// Default: "logs" (creates logs folder in application directory)
+    /// Example: "D:/Logs/DatabaseSync" or "/var/log/databasesync"
+    /// </summary>
+    public string LogPath { get; set; } = "logs";
+
+    /// <summary>
     /// Profile execution mode: Parallel or Sequential
     /// Parallel: All profiles run independently based on their schedules
     /// Sequential: Profiles run in order (by list position), waiting for previous to complete

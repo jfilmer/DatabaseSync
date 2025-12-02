@@ -2,9 +2,34 @@ using DatabaseSync.Configuration;
 using DatabaseSync.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Logging;
 using Serilog;
+
+// When running as a Windows Service, the current directory is system32
+// Use the application's base directory for logs and config
+var basePath = AppContext.BaseDirectory;
+
+// Read configuration early to get log path
+var earlyConfig = new ConfigurationBuilder()
+    .SetBasePath(basePath)
+    .AddJsonFile("appsettings.json", optional: true)
+    .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production"}.json", optional: true)
+    .Build();
+
+var syncServiceConfig = earlyConfig.GetSection("SyncService").Get<SyncServiceConfig>() ?? new SyncServiceConfig();
+
+// Determine log path - if relative, make it relative to basePath
+var configuredLogPath = syncServiceConfig.LogPath ?? "logs";
+var logDirectory = Path.IsPathRooted(configuredLogPath)
+    ? configuredLogPath
+    : Path.Combine(basePath, configuredLogPath);
+var logPath = Path.Combine(logDirectory, "sync-.log");
+
+// Ensure log directory exists
+Directory.CreateDirectory(logDirectory);
 
 // Configure Serilog
 Log.Logger = new LoggerConfiguration()
@@ -14,7 +39,7 @@ Log.Logger = new LoggerConfiguration()
     .Enrich.FromLogContext()
     .WriteTo.Console(outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}")
     .WriteTo.File(
-        path: "logs/sync-.log",
+        path: logPath,
         rollingInterval: RollingInterval.Day,
         outputTemplate: "{Timestamp:yyyy-MM-dd HH:mm:ss.fff} [{Level:u3}] {Message:lj}{NewLine}{Exception}")
     .CreateLogger();
@@ -57,6 +82,13 @@ try
     Log.Information("╚══════════════════════════════════════════════════════════════╝");
 
     var builder = WebApplication.CreateBuilder(args);
+
+    // Enable Windows Service support (no-op on Linux/macOS)
+    builder.Host.UseWindowsService();
+
+    // Set content root to application directory (important for Windows Service)
+    builder.Host.UseContentRoot(basePath);
+
     builder.Services.AddSerilog();
 
     // Load configuration
@@ -213,6 +245,11 @@ try
         catch (InvalidOperationException ex)
         {
             return Results.Conflict(new { Error = ex.Message });
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Unexpected error syncing table {Table} in profile {Profile}", tableName, profileName);
+            return Results.Json(new { Success = false, Error = ex.Message }, statusCode: 500);
         }
     }).WithName("TriggerTableSync");
 
@@ -459,7 +496,8 @@ static string GenerateDashboardHtml(
         .current-tables { background: #1e3a5f; color: #ffc107; padding: 8px 12px; margin: 10px 0; border-radius: 4px; font-size: 0.9em; font-family: monospace; }
         .failed-tables-alert { background: #5a1a1a; border: 1px solid #dc3545; color: #ff6b6b; padding: 12px; margin: 15px 0; border-radius: 6px; font-size: 0.9em; }
         .failed-tables-alert ul { margin: 8px 0 0 0; padding-left: 20px; }
-        .failed-tables-alert li { margin: 4px 0; }
+        .failed-tables-alert li { margin: 4px 0; cursor: help; }
+        .failed-tables-alert li[title]:hover { background: #4a1515; border-radius: 3px; padding: 2px 4px; margin-left: -4px; }
         .failed-tables-alert strong { color: #ff8787; }
         .profile-meta { color: #888; font-size: 0.9em; margin-bottom: 15px; }
         .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 15px; }
@@ -707,8 +745,11 @@ static string GenerateDashboardHtml(
                     var errorPreview = !string.IsNullOrEmpty(ft.ErrorMessage)
                         ? $" - {(ft.ErrorMessage.Length > 80 ? ft.ErrorMessage.Substring(0, 80) + "..." : ft.ErrorMessage)}"
                         : "";
+                    var fullError = !string.IsNullOrEmpty(ft.ErrorMessage)
+                        ? System.Web.HttpUtility.HtmlAttributeEncode(ft.ErrorMessage)
+                        : "";
                     sb.Append($@"
-                    <li><strong>{System.Web.HttpUtility.HtmlEncode(ft.SourceTable)}</strong>{System.Web.HttpUtility.HtmlEncode(errorPreview)}</li>");
+                    <li title=""{fullError}""><strong>{System.Web.HttpUtility.HtmlEncode(ft.SourceTable)}</strong>{System.Web.HttpUtility.HtmlEncode(errorPreview)}</li>");
                 }
                 sb.Append(@"
                 </ul>
@@ -847,7 +888,12 @@ static string GenerateProfileDashboardHtml(
 
             try {{
                 const response = await fetch(`/sync/${{profile}}/${{table}}`, {{ method: 'POST' }});
-                const result = await response.json();
+                let result;
+                try {{
+                    result = await response.json();
+                }} catch (jsonErr) {{
+                    result = {{ Error: 'Failed to parse response' }};
+                }}
 
                 if (response.ok && result.Success) {{
                     btn.textContent = 'Done!';
@@ -858,7 +904,8 @@ static string GenerateProfileDashboardHtml(
                     btn.textContent = 'Failed';
                     btn.style.background = '#dc3545';
                     btn.style.borderColor = '#dc3545';
-                    alert('Sync failed: ' + (result.Error || 'Unknown error'));
+                    const errorMsg = result.Error || result.error || (response.status === 409 ? 'Profile is already running' : 'Unknown error (HTTP ' + response.status + ')');
+                    alert('Sync failed: ' + errorMsg);
                     setTimeout(() => {{
                         btn.textContent = originalText;
                         btn.style.background = '';
