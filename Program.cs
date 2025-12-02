@@ -560,6 +560,11 @@ static string GenerateDashboardHtml(
         .start-now-btn { background: #28a745; color: #fff; border: none; padding: 12px 24px; border-radius: 6px; cursor: pointer; font-size: 1.1em; font-weight: bold; margin-left: 20px; transition: background 0.2s; }
         .start-now-btn:hover { background: #218838; }
         .start-now-btn:disabled { background: #666; cursor: not-allowed; }
+        .profile-sync-btn { background: #0f3460; color: #00d9ff; border: 1px solid #00d9ff; padding: 6px 16px; border-radius: 4px; cursor: pointer; font-size: 0.9em; font-weight: bold; transition: all 0.2s; }
+        .profile-sync-btn:hover { background: #00d9ff; color: #0f3460; }
+        .profile-sync-btn:disabled { background: #333; color: #666; border-color: #666; cursor: not-allowed; }
+        .profile-header { display: flex; justify-content: space-between; align-items: center; }
+        .profile-header-left { display: flex; align-items: center; gap: 10px; }
     </style>
     <script>
         let countdownInterval = null;
@@ -606,6 +611,57 @@ static string GenerateDashboardHtml(
             } catch (e) {
                 btn.textContent = 'Error';
                 btn.style.background = '#dc3545';
+            }
+        }
+
+        async function triggerProfileSync(profileName, btn) {
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Syncing...';
+
+            try {
+                const response = await fetch(`/sync/${encodeURIComponent(profileName)}`, { method: 'POST' });
+                if (response.ok) {
+                    btn.textContent = 'Started!';
+                    btn.style.background = '#28a745';
+                    btn.style.borderColor = '#28a745';
+                    setTimeout(() => location.reload(), 1500);
+                } else if (response.status === 409) {
+                    btn.textContent = 'Running';
+                    btn.style.background = '#ffc107';
+                    btn.style.borderColor = '#ffc107';
+                    btn.style.color = '#000';
+                    setTimeout(() => {
+                        btn.textContent = originalText;
+                        btn.style.background = '';
+                        btn.style.borderColor = '';
+                        btn.style.color = '';
+                        btn.disabled = false;
+                    }, 2000);
+                } else {
+                    const result = await response.json().catch(() => ({}));
+                    btn.textContent = 'Failed';
+                    btn.style.background = '#dc3545';
+                    btn.style.borderColor = '#dc3545';
+                    alert('Sync failed: ' + (result.error || 'Unknown error'));
+                    setTimeout(() => {
+                        btn.textContent = originalText;
+                        btn.style.background = '';
+                        btn.style.borderColor = '';
+                        btn.disabled = false;
+                    }, 2000);
+                }
+            } catch (err) {
+                btn.textContent = 'Error';
+                btn.style.background = '#dc3545';
+                btn.style.borderColor = '#dc3545';
+                alert('Request failed: ' + err.message);
+                setTimeout(() => {
+                    btn.textContent = originalText;
+                    btn.style.background = '';
+                    btn.style.borderColor = '';
+                    btn.disabled = false;
+                }, 2000);
             }
         }
     </script>
@@ -721,11 +777,15 @@ static string GenerateDashboardHtml(
         var nextRunStr = profile.IsRunning ? "" :
             profile.NextRunTime.HasValue ? $" | Next: {profile.NextRunTime.Value.ToLocalTime():MM-dd HH:mm}" : "";
 
+        var syncBtnDisabled = profile.IsRunning ? "disabled" : "";
         sb.Append($@"
         <div class=""profile-card"">
             <div class=""profile-header"">
-                <span class=""profile-name"">{System.Web.HttpUtility.HtmlEncode(profile.ProfileName)}</span>
-                <span class=""status-badge {statusClass}"">{statusText}</span>
+                <div class=""profile-header-left"">
+                    <span class=""profile-name"">{System.Web.HttpUtility.HtmlEncode(profile.ProfileName)}</span>
+                    <span class=""status-badge {statusClass}"">{statusText}</span>
+                </div>
+                <button class=""profile-sync-btn"" onclick=""triggerProfileSync('{Uri.EscapeDataString(profile.ProfileName)}', this)"" {syncBtnDisabled}>Sync Now</button>
             </div>{runningInfoHtml}
             <div class=""profile-meta"">
                 {System.Web.HttpUtility.HtmlEncode(profile.Description ?? "")} |

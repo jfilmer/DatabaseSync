@@ -635,6 +635,14 @@ Production (34M rows) → [Profile 1] → Staging → [Profile 2] → Downstream
 
 The web dashboard at `/dashboard` provides real-time visibility into sync operations.
 
+### Dashboard Features
+
+- **Profile Cards**: Each profile shows status, statistics, and next scheduled run
+- **Sync Now Button**: Click "Sync Now" on any profile card to trigger an immediate sync (bypasses startup delay and schedule)
+- **Table-level Sync**: On the profile detail page, each table has its own "Sync" button
+- **Auto-refresh**: Dashboard auto-refreshes every 30 seconds
+- **Startup Delay Banner**: When startup delay is active, shows countdown and "Start Now" button
+
 ### Dashboard Columns
 
 | Column | Description |
