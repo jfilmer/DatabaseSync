@@ -11,12 +11,32 @@ using Serilog;
 // When running as a Windows Service, the current directory is system32
 // Use the application's base directory for logs and config
 var basePath = AppContext.BaseDirectory;
+var environment = Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production";
+
+// Clear any file system caching - ensure we read fresh config files
+var baseConfigPath = Path.Combine(basePath, "appsettings.json");
+var envConfigPath = Path.Combine(basePath, $"appsettings.{environment}.json");
+
+// Log config file info for debugging cache issues
+Console.WriteLine($"Loading configuration from: {basePath}");
+Console.WriteLine($"  Environment: {environment}");
+if (File.Exists(baseConfigPath))
+{
+    var baseInfo = new FileInfo(baseConfigPath);
+    Console.WriteLine($"  appsettings.json: {baseInfo.Length:N0} bytes, modified {baseInfo.LastWriteTime:yyyy-MM-dd HH:mm:ss}");
+}
+if (File.Exists(envConfigPath))
+{
+    var envInfo = new FileInfo(envConfigPath);
+    Console.WriteLine($"  appsettings.{environment}.json: {envInfo.Length:N0} bytes, modified {envInfo.LastWriteTime:yyyy-MM-dd HH:mm:ss}");
+}
 
 // Read configuration early to get log path
+// Use reloadOnChange: false to ensure we get a fresh read each startup
 var earlyConfig = new ConfigurationBuilder()
     .SetBasePath(basePath)
-    .AddJsonFile("appsettings.json", optional: true)
-    .AddJsonFile($"appsettings.{Environment.GetEnvironmentVariable("ASPNETCORE_ENVIRONMENT") ?? "Production"}.json", optional: true)
+    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+    .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: false)
     .Build();
 
 var syncServiceConfig = earlyConfig.GetSection("SyncService").Get<SyncServiceConfig>() ?? new SyncServiceConfig();
@@ -81,19 +101,36 @@ try
     Log.Information("║        SQL Server/PostgreSQL Database Sync Service           ║");
     Log.Information("╚══════════════════════════════════════════════════════════════╝");
 
-    var builder = WebApplication.CreateBuilder(args);
+    // Set content root at builder creation (important for Windows Service where CWD is system32)
+    var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+    {
+        Args = args,
+        ContentRootPath = basePath
+    });
 
     // Enable Windows Service support (no-op on Linux/macOS)
     builder.Host.UseWindowsService();
 
-    // Set content root to application directory (important for Windows Service)
-    builder.Host.UseContentRoot(basePath);
-
     builder.Services.AddSerilog();
+
+    // Explicitly add config files with reloadOnChange: false to avoid caching issues
+    builder.Configuration.Sources.Clear();
+    builder.Configuration
+        .SetBasePath(basePath)
+        .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
+        .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: false)
+        .AddEnvironmentVariables();
 
     // Load configuration
     var config = builder.Configuration.GetSection("SyncService").Get<SyncServiceConfig>()
         ?? new SyncServiceConfig();
+
+    // Log what we loaded to help debug config issues
+    Log.Information("Loaded {ProfileCount} profile(s) from configuration", config.Profiles.Count);
+    foreach (var p in config.Profiles)
+    {
+        Log.Debug("  Profile '{Name}': {TableCount} tables", p.ProfileName, p.Tables.Count);
+    }
 
     // Validate configuration
     var validationResult = ConfigurationValidator.Validate(config);
