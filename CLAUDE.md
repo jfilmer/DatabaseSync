@@ -717,6 +717,12 @@ The `TypeMapper` class handles type conversion between databases:
 
 **The source database must NEVER be modified.** All source database connections are **strictly read-only**. Only `SELECT` queries, counts, and schema metadata queries are permitted on source connections. All write operations occur exclusively on the **target** database.
 
+### Database User Conventions
+
+**Environment-specific users**: Database users are specific to their environment. The production database user (e.g., `setlistmanagerprod`) only exists in the production database, and the development database user (e.g., `setlistmanagerdev`) only exists in the development database. Do not attempt to use cross-environment credentials.
+
+**Restricted permissions**: Sync users should have data manipulation privileges only (SELECT, INSERT, UPDATE, DELETE, TRUNCATE) but should NOT have schema modification privileges (CREATE, DROP). Tables should be owned by a separate admin user (e.g., `postgres` or `claude`), not by the sync user.
+
 ### Adding a New Feature
 
 1. Create models in `/Models` if needed

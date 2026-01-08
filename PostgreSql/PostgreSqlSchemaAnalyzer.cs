@@ -55,7 +55,7 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
                 c.numeric_scale AS Scale,
                 c.ordinal_position AS OrdinalPosition,
                 COALESCE(pk.is_pk, FALSE) AS IsPrimaryKey,
-                COALESCE(c.column_default LIKE 'nextval%', FALSE) AS IsIdentity
+                COALESCE(c.is_identity = 'YES', FALSE) AS IsIdentity
             FROM information_schema.columns c
             LEFT JOIN (
                 SELECT kcu.column_name, TRUE AS is_pk
@@ -200,16 +200,22 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         {
             var pkColumn = pkColumns[0];
             var sql = $"DELETE FROM \"{tableName}\" WHERE \"{pkColumn.ColumnName.ToLower()}\" = ANY(@pks)";
-            
-            object[] typedPks = pkColumn.DataType.ToLower() switch
+
+            // Use properly typed arrays - Npgsql requires explicit array types for ANY()
+            var baseType = pkColumn.DataType.ToLower();
+            if (baseType.Contains('('))
+                baseType = baseType.Substring(0, baseType.IndexOf('('));
+
+            object parameters = baseType switch
             {
-                "integer" or "int" => pkList.Select(int.Parse).Cast<object>().ToArray(),
-                "bigint" => pkList.Select(long.Parse).Cast<object>().ToArray(),
-                "uuid" => pkList.Select(Guid.Parse).Cast<object>().ToArray(),
-                _ => pkList.Cast<object>().ToArray()
+                "integer" or "int" or "int4" => new { pks = pkList.Select(int.Parse).ToArray() },
+                "bigint" or "int8" => new { pks = pkList.Select(long.Parse).ToArray() },
+                "smallint" or "int2" => new { pks = pkList.Select(short.Parse).ToArray() },
+                "uuid" => new { pks = pkList.Select(Guid.Parse).ToArray() },
+                _ => new { pks = pkList.ToArray() }
             };
 
-            return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
+            return await connection.ExecuteAsync(sql, parameters, commandTimeout: _commandTimeout);
         }
         else
         {

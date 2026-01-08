@@ -66,7 +66,8 @@ public class PostgreSqlBulkDataCopier
         var insertColumns = columns.Where(c => !c.IsIdentity).ToList();
         var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
-        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}"[..63];
+        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
+        if (stagingTableName.Length > 63) stagingTableName = stagingTableName[..63];
 
         await using var sourceConn = new NpgsqlConnection(_sourceConnectionString);
         await using var targetConn = new NpgsqlConnection(_targetConnectionString);
@@ -164,7 +165,8 @@ public class PostgreSqlBulkDataCopier
         var insertColumns = columns.Where(c => !c.IsIdentity).ToList();
         var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
-        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}"[..63];
+        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
+        if (stagingTableName.Length > 63) stagingTableName = stagingTableName[..63];
 
         await using var sourceConn = new NpgsqlConnection(_sourceConnectionString);
         await using var targetConn = new NpgsqlConnection(_targetConnectionString);
@@ -256,8 +258,7 @@ public class PostgreSqlBulkDataCopier
     {
         await conn.ExecuteAsync($@"
             CREATE TEMP TABLE ""{stagingTableName}""
-            (LIKE ""{targetTableName}"" INCLUDING DEFAULTS)
-            ON COMMIT DROP",
+            (LIKE ""{targetTableName}"" INCLUDING DEFAULTS)",
             commandTimeout: _commandTimeout);
     }
 
@@ -275,12 +276,13 @@ public class PostgreSqlBulkDataCopier
         await using var reader = await sourceConn.ExecuteReaderAsync(
             sourceQuery, parameters, commandTimeout: _commandTimeout);
 
-        await using var writer = await targetConn.BeginBinaryImportAsync(
-            $"COPY \"{stagingTableName}\" ({targetColumnList}) FROM STDIN (FORMAT BINARY)");
+        // Use text mode COPY for better type compatibility between PostgreSQL versions
+        await using var writer = await targetConn.BeginTextImportAsync(
+            $"COPY \"{stagingTableName}\" ({targetColumnList}) FROM STDIN (FORMAT TEXT, NULL '\\N')");
 
         while (await reader.ReadAsync())
         {
-            await writer.StartRowAsync();
+            var values = new string[columns.Count];
 
             for (int i = 0; i < columns.Count; i++)
             {
@@ -288,14 +290,67 @@ public class PostgreSqlBulkDataCopier
 
                 if (value == DBNull.Value || value == null)
                 {
-                    await writer.WriteNullAsync();
+                    values[i] = "\\N";  // NULL representation in COPY text format
+                }
+                else if (value is DateTime dt)
+                {
+                    // Format timestamp for PostgreSQL
+                    values[i] = dt.ToString("yyyy-MM-dd HH:mm:ss.ffffff");
+                }
+                else if (value is DateTimeOffset dto)
+                {
+                    // Format timestamptz for PostgreSQL
+                    values[i] = dto.ToString("yyyy-MM-dd HH:mm:ss.ffffffzzz");
+                }
+                else if (value is bool b)
+                {
+                    values[i] = b ? "t" : "f";
+                }
+                else if (value is byte[] bytes)
+                {
+                    // Bytea in hex format
+                    values[i] = "\\\\x" + BitConverter.ToString(bytes).Replace("-", "");
+                }
+                else if (value is System.Text.Json.JsonDocument jsonDoc)
+                {
+                    // Handle JSONB columns
+                    var strValue = jsonDoc.RootElement.GetRawText();
+                    strValue = strValue.Replace("\\", "\\\\")
+                                      .Replace("\t", "\\t")
+                                      .Replace("\n", "\\n")
+                                      .Replace("\r", "\\r");
+                    values[i] = strValue;
+                }
+                else if (value.GetType().FullName?.Contains("NpgsqlTsVector") == true ||
+                         value.GetType().Name == "NpgsqlTsVector")
+                {
+                    // Handle tsvector - use ToString() which returns proper tsvector format
+                    values[i] = value.ToString() ?? "";
+                }
+                else if (value.GetType().FullName?.Contains("Npgsql") == true ||
+                         value.GetType().FullName?.Contains("Json") == true)
+                {
+                    // Handle other JSON/Npgsql types by converting to string
+                    var strValue = System.Text.Json.JsonSerializer.Serialize(value);
+                    strValue = strValue.Replace("\\", "\\\\")
+                                      .Replace("\t", "\\t")
+                                      .Replace("\n", "\\n")
+                                      .Replace("\r", "\\r");
+                    values[i] = strValue;
                 }
                 else
                 {
-                    await writer.WriteAsync(value);
+                    // Escape special characters for COPY text format
+                    var strValue = value.ToString() ?? "";
+                    strValue = strValue.Replace("\\", "\\\\")
+                                      .Replace("\t", "\\t")
+                                      .Replace("\n", "\\n")
+                                      .Replace("\r", "\\r");
+                    values[i] = strValue;
                 }
             }
 
+            await writer.WriteLineAsync(string.Join("\t", values));
             rowsLoaded++;
 
             if (rowsLoaded % 100000 == 0)
@@ -305,7 +360,6 @@ public class PostgreSqlBulkDataCopier
             }
         }
 
-        await writer.CompleteAsync();
         return rowsLoaded;
     }
 

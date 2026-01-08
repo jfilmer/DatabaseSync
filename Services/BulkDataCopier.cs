@@ -76,7 +76,8 @@ public class BulkDataCopier
         var insertColumns = columns.Where(c => !c.IsIdentity).ToList();
         var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
-        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}"[..63];
+        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
+        if (stagingTableName.Length > 63) stagingTableName = stagingTableName[..63];
 
         await using var sourceConn = new SqlConnection(_sourceConnectionString);
         await using var targetConn = new NpgsqlConnection(_targetConnectionString);
@@ -176,7 +177,8 @@ public class BulkDataCopier
         var insertColumns = columns.Where(c => !c.IsIdentity).ToList();
         var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
-        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}"[..63];
+        var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
+        if (stagingTableName.Length > 63) stagingTableName = stagingTableName[..63];
 
         await using var sourceConn = new SqlConnection(_sourceConnectionString);
         await using var targetConn = new NpgsqlConnection(_targetConnectionString);
