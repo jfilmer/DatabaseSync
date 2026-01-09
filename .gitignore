@@ -43,6 +43,3 @@ appsettings*.json
 # Publish output
 publish/
 out/
-
-# Synology NAS metadata
-@eaDir/

@@ -89,48 +89,6 @@ public class BulkDataCopier
 
         try
         {
-            // TRUNCATE + INSERT path: Much faster for FullRefresh when data loss during failure is acceptable
-            if (config.TruncateOnFullRefresh)
-            {
-                _logger.LogInformation("Using TRUNCATE + INSERT mode");
-
-                // Truncate target table first
-                _logger.LogInformation("Truncating target table {Table}...", targetTableName);
-                await targetConn.ExecuteAsync(
-                    $"TRUNCATE TABLE \"{targetTableName}\"",
-                    commandTimeout: _commandTimeout);
-
-                // Build source query
-                var sourceColumnListTrunc = string.Join(", ", insertColumns.Select(c => $"[{c.ColumnName}]"));
-                var noLockHintTrunc = UseNoLock ? " WITH (NOLOCK)" : "";
-                var sourceQueryTrunc = $"SELECT {sourceColumnListTrunc} FROM [{sourceTableName}]{noLockHintTrunc}";
-
-                if (!string.IsNullOrEmpty(config.SourceFilter))
-                {
-                    sourceQueryTrunc += $" WHERE {config.SourceFilter}";
-                }
-
-                // Bulk copy directly to target (no staging needed)
-                _logger.LogInformation("Bulk copying data directly to target table{NoLock}...",
-                    UseNoLock ? " (NOLOCK)" : "");
-
-                var targetColumnListTrunc = string.Join(", ", insertColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
-
-                result.RowsProcessed = await BulkLoadDirectToTargetAsync(
-                    sourceConn, targetConn, sourceQueryTrunc, targetTableName, targetColumnListTrunc, insertColumns);
-
-                result.RowsInserted = result.RowsProcessed;
-                result.RowsUpdated = 0;
-                result.RowsDeleted = 0; // Truncate already removed all rows
-
-                _logger.LogInformation(
-                    "TRUNCATE + INSERT complete: {Inserted:N0} rows inserted",
-                    result.RowsInserted);
-
-                return result;
-            }
-
-            // Standard upsert path: Preserves data on failure
             // Create staging table
             _logger.LogDebug("Creating staging table {Staging}", stagingTableName);
             await CreateStagingTableAsync(targetConn, stagingTableName, targetTableName);
@@ -377,73 +335,6 @@ public class BulkDataCopier
             if (rowsLoaded % 100000 == 0)
             {
                 _logger.LogDebug("Loaded {Rows:N0} rows to staging...", rowsLoaded);
-                ProgressCallback?.Invoke(rowsLoaded);
-            }
-        }
-
-        await writer.CompleteAsync();
-        return rowsLoaded;
-    }
-
-    /// <summary>
-    /// Bulk load data directly to target table (used with TRUNCATE + INSERT mode).
-    /// Uses PostgreSQL COPY protocol for high-speed loading.
-    /// </summary>
-    private async Task<long> BulkLoadDirectToTargetAsync(
-        SqlConnection sourceConn,
-        NpgsqlConnection targetConn,
-        string sourceQuery,
-        string targetTableName,
-        string targetColumnList,
-        List<ColumnInfo> columns)
-    {
-        long rowsLoaded = 0;
-
-        await using var reader = await sourceConn.ExecuteReaderAsync(
-            sourceQuery, commandTimeout: _commandTimeout);
-
-        await using var writer = await targetConn.BeginBinaryImportAsync(
-            $"COPY \"{targetTableName}\" ({targetColumnList}) FROM STDIN (FORMAT BINARY)");
-
-        while (await reader.ReadAsync())
-        {
-            await writer.StartRowAsync();
-
-            for (int i = 0; i < columns.Count; i++)
-            {
-                var value = reader.GetValue(i);
-                var column = columns[i];
-
-                if (value == DBNull.Value || value == null)
-                {
-                    await writer.WriteNullAsync();
-                }
-                else
-                {
-                    try
-                    {
-                        var converted = _typeMapper.ConvertValue(value, column.DataType, column.MappedDataType);
-
-                        if (converted == DBNull.Value)
-                            await writer.WriteNullAsync();
-                        else
-                            await writer.WriteAsync(converted!);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(
-                            "Type conversion error at row {Row}, column {Column}: {Error}",
-                            rowsLoaded + 1, column.ColumnName, ex.Message);
-                        await writer.WriteNullAsync();
-                    }
-                }
-            }
-
-            rowsLoaded++;
-
-            if (rowsLoaded % 100000 == 0)
-            {
-                _logger.LogDebug("Loaded {Rows:N0} rows to target...", rowsLoaded);
                 ProgressCallback?.Invoke(rowsLoaded);
             }
         }
