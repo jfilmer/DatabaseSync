@@ -48,11 +48,13 @@ public class PostgreSqlBulkDataCopier
     /// <summary>
     /// Perform a bulk upsert: insert new rows, update existing rows
     /// </summary>
+    /// <param name="skipDelete">If true, skip the delete phase (for two-phase sync where deletes run separately)</param>
     public async Task<BulkCopyResult> BulkUpsertAsync(
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> columns,
-        TableConfig config)
+        TableConfig config,
+        bool skipDelete = false)
     {
         var result = new BulkCopyResult();
 
@@ -120,8 +122,8 @@ public class PostgreSqlBulkDataCopier
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
-            // Handle synchronized deletes
-            if (config.DeleteMode == DeleteMode.Sync)
+            // Handle synchronized deletes (unless skipDelete is true for two-phase sync)
+            if (config.DeleteMode == DeleteMode.Sync && !skipDelete)
             {
                 result.RowsDeleted = await SyncDeletesAsync(
                     sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter);
@@ -144,14 +146,42 @@ public class PostgreSqlBulkDataCopier
     }
 
     /// <summary>
+    /// Perform delete sync only - delete rows from target that don't exist in source.
+    /// Used for two-phase sync where deletes run in reverse priority order.
+    /// </summary>
+    public async Task<long> PerformDeleteSyncAsync(
+        string sourceTableName,
+        string targetTableName,
+        List<ColumnInfo> columns,
+        string? sourceFilter)
+    {
+        var pkColumns = columns.Where(c => c.IsPrimaryKey).ToList();
+        if (!pkColumns.Any())
+        {
+            _logger.LogWarning("Table {Table} has no primary key. Cannot perform delete sync.", sourceTableName);
+            return 0;
+        }
+
+        await using var sourceConn = new NpgsqlConnection(_sourceConnectionString);
+        await using var targetConn = new NpgsqlConnection(_targetConnectionString);
+
+        await sourceConn.OpenAsync();
+        await targetConn.OpenAsync();
+
+        return await SyncDeletesAsync(sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, sourceFilter);
+    }
+
+    /// <summary>
     /// Perform incremental upsert - only rows changed since last sync
     /// </summary>
+    /// <param name="skipDelete">If true, skip the delete phase (for two-phase sync where deletes run separately)</param>
     public async Task<BulkCopyResult> IncrementalUpsertAsync(
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> columns,
         TableConfig config,
-        DateTime lastSyncTime)
+        DateTime lastSyncTime,
+        bool skipDelete = false)
     {
         var result = new BulkCopyResult();
 
@@ -232,12 +262,13 @@ public class PostgreSqlBulkDataCopier
 
             // Handle synchronized deletes (full PK comparison)
             // For incremental sync, only perform deletes if SyncAllDeletes is enabled
-            if (config.DeleteMode == DeleteMode.Sync && config.SyncAllDeletes)
+            // Skip if skipDelete is true (for two-phase sync where deletes run separately)
+            if (config.DeleteMode == DeleteMode.Sync && config.SyncAllDeletes && !skipDelete)
             {
                 result.RowsDeleted = await SyncDeletesAsync(
                     sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter);
             }
-            else if (config.DeleteMode == DeleteMode.Sync && !config.SyncAllDeletes)
+            else if (config.DeleteMode == DeleteMode.Sync && !config.SyncAllDeletes && !skipDelete)
             {
                 _logger.LogDebug("Skipping delete sync for incremental mode (SyncAllDeletes is false)");
             }

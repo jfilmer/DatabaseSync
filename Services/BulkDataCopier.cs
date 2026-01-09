@@ -58,11 +58,13 @@ public class BulkDataCopier
     /// <summary>
     /// Perform a bulk upsert: insert new rows, update existing rows
     /// </summary>
+    /// <param name="skipDelete">If true, skip the delete phase (for two-phase sync where deletes run separately)</param>
     public async Task<BulkCopyResult> BulkUpsertAsync(
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> columns,
-        TableConfig config)
+        TableConfig config,
+        bool skipDelete = false)
     {
         var result = new BulkCopyResult();
         
@@ -158,12 +160,14 @@ public class BulkDataCopier
     /// <summary>
     /// Perform incremental upsert - only rows changed since last sync
     /// </summary>
+    /// <param name="skipDelete">If true, skip the delete phase (for two-phase sync where deletes run separately)</param>
     public async Task<BulkCopyResult> IncrementalUpsertAsync(
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> columns,
         TableConfig config,
-        DateTime lastSyncTime)
+        DateTime lastSyncTime,
+        bool skipDelete = false)
     {
         var result = new BulkCopyResult();
 

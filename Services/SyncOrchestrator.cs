@@ -187,7 +187,7 @@ public class SyncOrchestrator
     /// <summary>
     /// Sync a single table
     /// </summary>
-    public async Task<SyncResult> SyncTableAsync(TableConfig tableConfig, bool forceFullRefresh = false)
+    public async Task<SyncResult> SyncTableAsync(TableConfig tableConfig, bool forceFullRefresh = false, bool skipDelete = false)
     {
         var result = new SyncResult { TableName = tableConfig.SourceTable };
         var stopwatch = Stopwatch.StartNew();
@@ -356,7 +356,7 @@ public class SyncOrchestrator
 
             if (effectiveMode == SyncMode.FullRefresh)
             {
-                copyResult = await ExecuteBulkUpsertAsync(sourceTableName, targetTableName, filteredColumns, tableConfig);
+                copyResult = await ExecuteBulkUpsertAsync(sourceTableName, targetTableName, filteredColumns, tableConfig, skipDelete);
             }
             else
             {
@@ -367,7 +367,7 @@ public class SyncOrchestrator
                 }
 
                 copyResult = await ExecuteIncrementalUpsertAsync(
-                    sourceTableName, targetTableName, filteredColumns, tableConfig, lastSyncTime ?? sqlMinDate);
+                    sourceTableName, targetTableName, filteredColumns, tableConfig, lastSyncTime ?? sqlMinDate, skipDelete);
 
                 maxSourceTimestamp = await _sourceAnalyzer.GetMaxTimestampAsync(
                     sourceTableName, tableConfig.TimestampColumn);
@@ -478,6 +478,16 @@ public class SyncOrchestrator
             _profile.ProfileName,
             _profile.Tables.Count);
 
+        // Check if we need two-phase sync (PostgreSQL-to-PostgreSQL with DeleteMode.Sync)
+        var needsTwoPhaseSync = _sourceDatabaseType == DatabaseType.PostgreSql &&
+                                _targetDatabaseType == DatabaseType.PostgreSql &&
+                                _profile.Tables.Any(t => t.DeleteMode == DeleteMode.Sync);
+
+        if (needsTwoPhaseSync)
+        {
+            _logger.LogInformation("Using two-phase sync (upserts first, then deletes in reverse priority order)");
+        }
+
         // Group tables by priority
         var tablesByPriority = _profile.Tables
             .OrderBy(t => t.Priority)
@@ -487,6 +497,10 @@ public class SyncOrchestrator
         var results = new ConcurrentBag<SyncResult>();
         var failedTables = new ConcurrentBag<string>();
 
+        // Track table schemas for delete phase (only needed for two-phase sync)
+        var tableSchemas = new ConcurrentDictionary<string, List<ColumnInfo>>();
+
+        // Phase 1: Upsert all tables in priority order
         foreach (var priorityGroup in tablesByPriority)
         {
             _logger.LogDebug("Processing priority {Priority} with {Count} tables",
@@ -517,7 +531,8 @@ public class SyncOrchestrator
                             loadThrottling.MaxWaitMinutes);
                     }
 
-                    var result = await SyncTableAsync(tableConfig, forceFullRefresh);
+                    // Skip deletes in first phase if using two-phase sync
+                    var result = await SyncTableAsync(tableConfig, forceFullRefresh, skipDelete: needsTwoPhaseSync);
                     results.Add(result);
                     LogTableResult(result);
 
@@ -544,6 +559,7 @@ public class SyncOrchestrator
                     // Capture load monitor/throttling for closure
                     var monitor = loadMonitor;
                     var throttling = loadThrottling;
+                    var twoPhase = needsTwoPhaseSync;
 
                     tasks.Add(Task.Run(async () =>
                     {
@@ -563,7 +579,8 @@ public class SyncOrchestrator
                                     throttling.MaxWaitMinutes);
                             }
 
-                            var result = await SyncTableAsync(config, forceFullRefresh);
+                            // Skip deletes in first phase if using two-phase sync
+                            var result = await SyncTableAsync(config, forceFullRefresh, skipDelete: twoPhase);
                             results.Add(result);
                             LogTableResult(result);
 
@@ -578,6 +595,66 @@ public class SyncOrchestrator
                 }
 
                 await Task.WhenAll(tasks);
+            }
+        }
+
+        // Phase 2: Delete in reverse priority order (only for two-phase sync)
+        if (needsTwoPhaseSync)
+        {
+            _logger.LogInformation("Phase 2: Processing deletes in reverse priority order...");
+
+            var tablesWithDeletes = _profile.Tables
+                .Where(t => t.DeleteMode == DeleteMode.Sync)
+                .OrderByDescending(t => t.Priority)
+                .GroupBy(t => t.Priority)
+                .ToList();
+
+            foreach (var priorityGroup in tablesWithDeletes)
+            {
+                _logger.LogDebug("Processing deletes for priority {Priority} with {Count} tables",
+                    priorityGroup.Key, priorityGroup.Count());
+
+                foreach (var tableConfig in priorityGroup)
+                {
+                    // Skip if table failed during upsert phase
+                    if (failedTables.Contains(tableConfig.SourceTable))
+                    {
+                        _logger.LogWarning("Skipping delete for {Table} due to previous failure",
+                            tableConfig.SourceTable);
+                        continue;
+                    }
+
+                    try
+                    {
+                        var sourceTableName = GetEffectiveSourceTableName(tableConfig);
+                        var targetTableName = GetEffectiveTargetTableName(tableConfig);
+
+                        // Get schema for delete operation
+                        var schema = await _sourceAnalyzer.GetTableSchemaAsync(sourceTableName);
+
+                        _logger.LogInformation("Syncing deletes for {Table}...", tableConfig.SourceTable);
+                        var deletedCount = await ExecuteDeleteSyncAsync(
+                            sourceTableName, targetTableName, schema, tableConfig.SourceFilter);
+
+                        if (deletedCount > 0)
+                        {
+                            _logger.LogInformation("Deleted {Count:N0} rows from {Table}",
+                                deletedCount, tableConfig.TargetTable);
+
+                            // Update the result with delete count
+                            var existingResult = results.FirstOrDefault(r => r.TableName == tableConfig.SourceTable);
+                            if (existingResult != null)
+                            {
+                                existingResult.RowsDeleted = deletedCount;
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Delete sync failed for {Table}", tableConfig.SourceTable);
+                        // Don't fail the entire sync for delete errors
+                    }
+                }
             }
         }
 
@@ -749,21 +826,22 @@ CREATE TABLE [{tableName}] (
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> columns,
-        TableConfig config)
+        TableConfig config,
+        bool skipDelete = false)
     {
         return (_sourceDatabaseType, _targetDatabaseType) switch
         {
             (DatabaseType.SqlServer, DatabaseType.PostgreSql) =>
-                await _sqlServerToPostgreSqlCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config),
+                await _sqlServerToPostgreSqlCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config, skipDelete),
 
             (DatabaseType.SqlServer, DatabaseType.SqlServer) =>
-                await _sqlServerToSqlServerCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config),
+                await _sqlServerToSqlServerCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config, skipDelete),
 
             (DatabaseType.PostgreSql, DatabaseType.PostgreSql) =>
-                await _postgreSqlToPostgreSqlCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config),
+                await _postgreSqlToPostgreSqlCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config, skipDelete),
 
             (DatabaseType.PostgreSql, DatabaseType.SqlServer) =>
-                await _postgreSqlToSqlServerCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config),
+                await _postgreSqlToSqlServerCopier!.BulkUpsertAsync(sourceTableName, targetTableName, columns, config, skipDelete),
 
             _ => throw new NotSupportedException(
                 $"Sync from {_sourceDatabaseType} to {_targetDatabaseType} is not supported")
@@ -778,25 +856,49 @@ CREATE TABLE [{tableName}] (
         string targetTableName,
         List<ColumnInfo> columns,
         TableConfig config,
-        DateTime lastSyncTime)
+        DateTime lastSyncTime,
+        bool skipDelete = false)
     {
         return (_sourceDatabaseType, _targetDatabaseType) switch
         {
             (DatabaseType.SqlServer, DatabaseType.PostgreSql) =>
-                await _sqlServerToPostgreSqlCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime),
+                await _sqlServerToPostgreSqlCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime, skipDelete),
 
             (DatabaseType.SqlServer, DatabaseType.SqlServer) =>
-                await _sqlServerToSqlServerCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime),
+                await _sqlServerToSqlServerCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime, skipDelete),
 
             (DatabaseType.PostgreSql, DatabaseType.PostgreSql) =>
-                await _postgreSqlToPostgreSqlCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime),
+                await _postgreSqlToPostgreSqlCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime, skipDelete),
 
             (DatabaseType.PostgreSql, DatabaseType.SqlServer) =>
-                await _postgreSqlToSqlServerCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime),
+                await _postgreSqlToSqlServerCopier!.IncrementalUpsertAsync(sourceTableName, targetTableName, columns, config, lastSyncTime, skipDelete),
 
             _ => throw new NotSupportedException(
                 $"Sync from {_sourceDatabaseType} to {_targetDatabaseType} is not supported")
         };
+    }
+
+    /// <summary>
+    /// Execute delete sync only for a table (used in two-phase sync)
+    /// </summary>
+    private async Task<long> ExecuteDeleteSyncAsync(
+        string sourceTableName,
+        string targetTableName,
+        List<ColumnInfo> columns,
+        string? sourceFilter)
+    {
+        // Currently only PostgreSQL-to-PostgreSQL supports separate delete sync
+        if (_sourceDatabaseType == DatabaseType.PostgreSql && _targetDatabaseType == DatabaseType.PostgreSql)
+        {
+            return await _postgreSqlToPostgreSqlCopier!.PerformDeleteSyncAsync(
+                sourceTableName, targetTableName, columns, sourceFilter);
+        }
+
+        // For other combinations, log a warning - deletes should be handled inline
+        _logger.LogWarning(
+            "Separate delete sync not implemented for {Source} to {Target}. Deletes should be handled inline.",
+            _sourceDatabaseType, _targetDatabaseType);
+        return 0;
     }
 
     /// <summary>
