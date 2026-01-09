@@ -25,6 +25,10 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
 
     public async Task InitializeAsync()
     {
+        const string checkTableExistsSql = @"
+            SELECT COUNT(1) FROM information_schema.tables
+            WHERE table_schema = 'public' AND table_name = '_sync_history'";
+
         const string createTableSql = $@"
             CREATE TABLE IF NOT EXISTS ""{TableName}"" (
                 id BIGSERIAL PRIMARY KEY,
@@ -81,9 +85,38 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
         ";
 
         await using var connection = new NpgsqlConnection(_connectionString);
-        await connection.ExecuteAsync(createTableSql);
-        await connection.ExecuteAsync(addRecentRowsColumnSql);
-        await connection.ExecuteAsync(addTotalSourceRowsColumnSql);
+
+        // Check if table exists first - skip CREATE if it does (for users without CREATE permission)
+        var tableExists = await connection.ExecuteScalarAsync<int>(checkTableExistsSql) > 0;
+
+        if (!tableExists)
+        {
+            try
+            {
+                await connection.ExecuteAsync(createTableSql);
+            }
+            catch (PostgresException ex) when (ex.SqlState == "42501")
+            {
+                _logger.LogWarning(
+                    "Cannot create sync history table - permission denied. " +
+                    "Please create the _sync_history table manually with a privileged user.");
+                throw;
+            }
+        }
+
+        // Only run ALTER TABLE if table exists and user might have ALTER permission
+        if (tableExists)
+        {
+            try
+            {
+                await connection.ExecuteAsync(addRecentRowsColumnSql);
+                await connection.ExecuteAsync(addTotalSourceRowsColumnSql);
+            }
+            catch (PostgresException ex) when (ex.SqlState == "42501")
+            {
+                _logger.LogDebug("Cannot alter sync history table - permission denied. Columns may already exist.");
+            }
+        }
 
         _logger.LogDebug("Sync history table initialized");
     }

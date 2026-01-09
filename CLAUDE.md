@@ -723,6 +723,40 @@ The `TypeMapper` class handles type conversion between databases:
 
 **Restricted permissions**: Sync users should have data manipulation privileges only (SELECT, INSERT, UPDATE, DELETE, TRUNCATE) but should NOT have schema modification privileges (CREATE, DROP). Tables should be owned by a separate admin user (e.g., `postgres` or `claude`), not by the sync user.
 
+**Pre-creating sync history table**: When using restricted database users without CREATE permission, the `_sync_history` table must be pre-created by an admin user. Run the following SQL with a privileged user (e.g., `postgres` or `claude`):
+
+```sql
+-- Create the sync history table
+CREATE TABLE IF NOT EXISTS "_sync_history" (
+    id BIGSERIAL PRIMARY KEY,
+    run_id UUID NOT NULL,
+    profile_name VARCHAR(100) NOT NULL,
+    source_table VARCHAR(255) NOT NULL,
+    target_table VARCHAR(255) NOT NULL,
+    sync_start_time TIMESTAMP NOT NULL,
+    sync_end_time TIMESTAMP NOT NULL,
+    success BOOLEAN NOT NULL,
+    rows_processed BIGINT NOT NULL DEFAULT 0,
+    rows_inserted BIGINT NOT NULL DEFAULT 0,
+    rows_updated BIGINT NOT NULL DEFAULT 0,
+    rows_deleted BIGINT NOT NULL DEFAULT 0,
+    error_message TEXT,
+    max_source_timestamp TIMESTAMP,
+    duration_seconds DOUBLE PRECISION NOT NULL,
+    recent_rows_count BIGINT NOT NULL DEFAULT 0,
+    total_source_rows BIGINT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_sync_history_profile_table ON "_sync_history" (profile_name, source_table);
+CREATE INDEX IF NOT EXISTS idx_sync_history_run_id ON "_sync_history" (run_id);
+CREATE INDEX IF NOT EXISTS idx_sync_history_sync_time ON "_sync_history" (sync_end_time DESC);
+
+-- Grant permissions to the sync user
+GRANT SELECT, INSERT, UPDATE, DELETE ON "_sync_history" TO your_sync_user;
+GRANT USAGE, SELECT ON SEQUENCE _sync_history_id_seq TO your_sync_user;
+```
+
 ### Adding a New Feature
 
 1. Create models in `/Models` if needed
