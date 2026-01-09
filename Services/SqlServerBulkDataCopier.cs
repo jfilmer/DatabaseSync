@@ -104,6 +104,49 @@ public class SqlServerBulkDataCopier
 
         try
         {
+            // TRUNCATE + INSERT path: Much faster and minimally logged for FullRefresh
+            if (config.TruncateOnFullRefresh)
+            {
+                _logger.LogInformation("Using TRUNCATE + INSERT mode (minimally logged)");
+
+                // Truncate target table first
+                _logger.LogInformation("Truncating target table {Table}...", targetTableName);
+                await targetConn.ExecuteAsync(
+                    $"TRUNCATE TABLE [{targetTableName}]",
+                    commandTimeout: _commandTimeout);
+
+                // Build source query
+                var sourceColumnListTrunc = string.Join(", ", allColumns.Select(c =>
+                    IsSpatialType(c.DataType)
+                        ? $"CAST([{c.ColumnName}] AS varbinary(MAX)) AS [{c.ColumnName}]"
+                        : $"[{c.ColumnName}]"));
+                var noLockHintTrunc = UseNoLock ? " WITH (NOLOCK)" : "";
+                var sourceQueryTrunc = $"SELECT {sourceColumnListTrunc} FROM [{sourceTableName}]{noLockHintTrunc}";
+
+                if (!string.IsNullOrEmpty(config.SourceFilter))
+                {
+                    sourceQueryTrunc += $" WHERE {config.SourceFilter}";
+                }
+
+                // Bulk copy directly to target (no staging needed)
+                _logger.LogInformation("Bulk copying data directly to target table{NoLock}...",
+                    UseNoLock ? " (NOLOCK)" : "");
+
+                result.RowsProcessed = await BulkCopyDirectToTargetAsync(
+                    sourceConn, targetConn, sourceQueryTrunc, targetTableName, allColumns, hasIdentity);
+
+                result.RowsInserted = result.RowsProcessed;
+                result.RowsUpdated = 0;
+                result.RowsDeleted = 0; // Truncate already removed all rows
+
+                _logger.LogInformation(
+                    "TRUNCATE + INSERT complete: {Inserted:N0} rows inserted",
+                    result.RowsInserted);
+
+                return result;
+            }
+
+            // Standard MERGE path: Preserves data on failure but generates more log
             // Create staging table (temp table in SQL Server) - include all columns
             _logger.LogDebug("Creating staging table {Staging}", stagingTableName);
             await CreateStagingTableAsync(targetConn, stagingTableName, targetTableName, allColumns);
@@ -162,7 +205,7 @@ public class SqlServerBulkDataCopier
             result.RowsUpdated = mergeResult.Updated;
 
             // Handle synchronized deletes using staging table (much faster than loading PKs to memory)
-            if (config.DeleteMode == DeleteMode.Sync)
+            if (config.DeleteMode == DeleteMode.Sync && !skipDelete)
             {
                 result.RowsDeleted = await SyncDeletesUsingStagingAsync(
                     targetConn, stagingTableName, targetTableName, pkColumns);
@@ -406,6 +449,106 @@ public class SqlServerBulkDataCopier
         using var bulkCopy = new SqlBulkCopy(targetConn)
         {
             DestinationTableName = stagingTableName,
+            BatchSize = 10000,
+            BulkCopyTimeout = _commandTimeout
+        };
+
+        // Map columns
+        foreach (var col in columns)
+        {
+            bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+        }
+
+        await bulkCopy.WriteToServerAsync(dataTable);
+    }
+
+    /// <summary>
+    /// Bulk copy data directly to target table (used with TRUNCATE + INSERT mode).
+    /// Handles IDENTITY_INSERT if the table has identity columns.
+    /// </summary>
+    private async Task<long> BulkCopyDirectToTargetAsync(
+        SqlConnection sourceConn,
+        SqlConnection targetConn,
+        string sourceQuery,
+        string targetTableName,
+        List<ColumnInfo> columns,
+        bool hasIdentity)
+    {
+        long rowsLoaded = 0;
+
+        // Enable IDENTITY_INSERT if needed
+        if (hasIdentity)
+        {
+            await targetConn.ExecuteAsync(
+                $"SET IDENTITY_INSERT [{targetTableName}] ON",
+                commandTimeout: _commandTimeout);
+        }
+
+        try
+        {
+            // Read from source into a DataTable
+            await using var reader = await sourceConn.ExecuteReaderAsync(
+                sourceQuery, commandTimeout: _commandTimeout);
+
+            var dataTable = new DataTable();
+            foreach (var col in columns)
+            {
+                dataTable.Columns.Add(col.ColumnName, GetClrType(col.DataType));
+            }
+
+            while (await reader.ReadAsync())
+            {
+                var row = dataTable.NewRow();
+                for (int i = 0; i < columns.Count; i++)
+                {
+                    var value = reader.GetValue(i);
+                    row[i] = value == DBNull.Value ? DBNull.Value : value;
+                }
+                dataTable.Rows.Add(row);
+                rowsLoaded++;
+
+                // Batch insert every 100k rows to manage memory
+                if (rowsLoaded % 100000 == 0)
+                {
+                    await BulkInsertToTargetAsync(targetConn, targetTableName, dataTable, columns);
+                    _logger.LogDebug("Loaded {Rows:N0} rows to target...", rowsLoaded);
+                    ProgressCallback?.Invoke(rowsLoaded);
+                    dataTable.Clear();
+                }
+            }
+
+            // Insert remaining rows
+            if (dataTable.Rows.Count > 0)
+            {
+                await BulkInsertToTargetAsync(targetConn, targetTableName, dataTable, columns);
+            }
+        }
+        finally
+        {
+            // Disable IDENTITY_INSERT
+            if (hasIdentity)
+            {
+                await targetConn.ExecuteAsync(
+                    $"SET IDENTITY_INSERT [{targetTableName}] OFF",
+                    commandTimeout: _commandTimeout);
+            }
+        }
+
+        return rowsLoaded;
+    }
+
+    /// <summary>
+    /// Insert DataTable directly to target table using SqlBulkCopy.
+    /// </summary>
+    private async Task BulkInsertToTargetAsync(
+        SqlConnection targetConn,
+        string targetTableName,
+        DataTable dataTable,
+        List<ColumnInfo> columns)
+    {
+        using var bulkCopy = new SqlBulkCopy(targetConn)
+        {
+            DestinationTableName = targetTableName,
             BatchSize = 10000,
             BulkCopyTimeout = _commandTimeout
         };

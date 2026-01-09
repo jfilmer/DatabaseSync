@@ -727,7 +727,16 @@ public class TableConfig
     /// Sync mode: FullRefresh or Incremental
     /// </summary>
     public SyncMode Mode { get; set; } = SyncMode.Incremental;
-    
+
+    /// <summary>
+    /// For FullRefresh mode: TRUNCATE target table before loading data.
+    /// This is minimally logged in SQL Server and significantly reduces transaction log growth.
+    /// WARNING: If sync fails after truncate, the target table will be empty until next successful sync.
+    /// Only use when you can tolerate temporary data loss during sync failures.
+    /// Default is false (uses MERGE/upsert pattern which preserves data on failure).
+    /// </summary>
+    public bool TruncateOnFullRefresh { get; set; } = false;
+
     /// <summary>
     /// Column containing last modified timestamp (required for Incremental mode)
     /// </summary>

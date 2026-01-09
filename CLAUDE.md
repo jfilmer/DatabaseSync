@@ -194,6 +194,7 @@ A high-performance, standalone database synchronization service that supports **
 | Batched MERGE for large tables | SQL Server targets batch MERGE in 1M row chunks for tables >1M rows |
 | NOLOCK hints (SQL Server) | Reduce blocking on source database with WITH (NOLOCK) |
 | Source row batching | Read source data in batches to reduce memory pressure |
+| TRUNCATE + INSERT mode | TruncateOnFullRefresh option reduces SQL Server transaction log growth |
 
 ---
 
@@ -250,7 +251,8 @@ SyncService
 │       ├── DeleteMode (None/Sync)
 │       ├── SyncAllDeletes
 │       ├── CreateIfMissing
-│       └── SourceFilter
+│       ├── SourceFilter
+│       └── TruncateOnFullRefresh
 ```
 
 ---
@@ -284,6 +286,7 @@ SyncService
 | `CreateIfMissing` | `false` | Auto-create target table | Initial setup, migrations. Don't use in prod without review |
 | `Priority` | `100` | Sync order (lower = first) | Use when tables have FK dependencies. Same priority = parallel |
 | `SourceFilter` | - | WHERE clause to filter source data | When you only want to sync a subset of rows |
+| `TruncateOnFullRefresh` | `false` | TRUNCATE + INSERT instead of MERGE/upsert | Reduce SQL Server transaction log growth for FullRefresh tables |
 
 ### Database Type Configuration
 
@@ -492,6 +495,65 @@ Set to `0` to disable batching (stream all rows in single query).
   }
 }
 ```
+
+---
+
+## TRUNCATE + INSERT Mode (TruncateOnFullRefresh)
+
+For `FullRefresh` tables, the default behavior uses a staging table with MERGE/upsert operations. This is safe (data preserved if sync fails) but generates significant transaction log activity in SQL Server.
+
+The `TruncateOnFullRefresh` option provides an alternative approach that significantly reduces transaction log growth:
+
+### How It Works
+
+**Standard Mode (TruncateOnFullRefresh: false)**:
+1. Load data to staging table
+2. Execute MERGE to upsert all rows
+3. Delete orphaned rows (if DeleteMode: Sync)
+
+**Truncate Mode (TruncateOnFullRefresh: true)**:
+1. TRUNCATE target table (minimally logged)
+2. Bulk insert all rows directly (minimally logged with SqlBulkCopy)
+3. No separate delete step needed (TRUNCATE removed everything)
+
+### Benefits
+
+| Aspect | Standard Mode | Truncate Mode |
+|--------|---------------|---------------|
+| Transaction Log | High (full logging of MERGE) | Low (minimally logged operations) |
+| Speed | Good | Faster (no MERGE overhead) |
+| Data Safety | High (preserves data on failure) | Lower (table empty if sync fails) |
+| Delete Handling | Separate delete phase | Implicit (truncate removes all) |
+
+### When to Use
+
+**Use TruncateOnFullRefresh: true when:**
+- Transaction log growth is a significant concern
+- The table is a full mirror (all source rows should be in target)
+- You can tolerate temporary data unavailability during sync
+- The source system is reliable and sync failures are rare
+
+**Keep TruncateOnFullRefresh: false (default) when:**
+- Data must be available even during sync failures
+- You need row-level change detection (updates vs inserts)
+- The table is critical and downtime is unacceptable
+
+### Configuration Example
+
+```json
+{
+  "SourceTable": "LargeReportData",
+  "TargetTable": "large_report_data",
+  "Mode": "FullRefresh",
+  "TruncateOnFullRefresh": true
+}
+```
+
+### SQL Server Transaction Log Impact
+
+TRUNCATE is a minimally logged operation in SQL Server, and SqlBulkCopy with a heap or clustered index uses minimal logging under certain conditions (simple/bulk-logged recovery model, TABLOCK hint). This combination can reduce transaction log usage by 90%+ compared to MERGE operations.
+
+**Note**: `TruncateOnFullRefresh` only applies to `FullRefresh` mode tables. It is ignored for `Incremental` mode.
 
 ---
 
@@ -849,4 +911,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added single-instance enforcement via file lock; added batched MERGE for large tables (>1M rows) on SQL Server targets*
+*Last Updated: Added TruncateOnFullRefresh option to reduce SQL Server transaction log growth for FullRefresh tables*
