@@ -629,6 +629,45 @@ Production (34M rows) → [Profile 1] → Staging → [Profile 2] → Downstream
 }
 ```
 
+### Two-Phase Sync (FK-Safe Deletes)
+
+For **PostgreSQL-to-PostgreSQL** syncs with `DeleteMode: Sync`, the service automatically uses two-phase sync to prevent foreign key constraint violations:
+
+**Phase 1 - Upserts (Priority Order: 1→2→3→4)**
+- Parent tables are synced first (lower priority numbers)
+- All insert/update operations complete before any deletes
+- Ensures child records can reference parent records
+
+**Phase 2 - Deletes (Reverse Priority Order: 4→3→2→1)**
+- Child tables are deleted first (higher priority numbers)
+- Parent tables are deleted last
+- Prevents FK violations when removing records
+
+**How it works:**
+1. Service detects PostgreSQL-to-PostgreSQL sync with any `DeleteMode: Sync` tables
+2. Automatically enables two-phase mode (logged: "Using two-phase sync")
+3. All tables complete upserts with deletes skipped
+4. Deletes run in reverse priority order
+
+**Example Priority Setup for FK Dependencies:**
+```json
+{
+  "Tables": [
+    { "SourceTable": "users", "Priority": 1, "DeleteMode": "Sync" },
+    { "SourceTable": "orders", "Priority": 2, "DeleteMode": "Sync" },
+    { "SourceTable": "order_items", "Priority": 3, "DeleteMode": "Sync" }
+  ]
+}
+```
+
+With this configuration:
+- **Upserts**: users → orders → order_items
+- **Deletes**: order_items → orders → users
+
+This ensures `order_items` referencing `orders` are deleted before the parent `orders` rows, and `orders` referencing `users` are deleted before the parent `users` rows.
+
+**Note:** Two-phase sync is automatic for PostgreSQL-to-PostgreSQL. Other database combinations handle deletes inline (within each table's sync operation).
+
 ---
 
 ## Dashboard
