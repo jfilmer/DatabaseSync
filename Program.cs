@@ -121,12 +121,23 @@ try
         .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: false)
         .AddEnvironmentVariables();
 
-    // Load configuration
-    var config = builder.Configuration.GetSection("SyncService").Get<SyncServiceConfig>()
+    // Load base configuration
+    var baseConfig = builder.Configuration.GetSection("SyncService").Get<SyncServiceConfig>()
         ?? new SyncServiceConfig();
 
+    // Load profiles from inline config + external files
+    var allProfiles = ProfileLoader.LoadProfiles(
+        baseConfig,
+        basePath,
+        environment,
+        Log.Logger);
+
+    // Replace inline profiles with merged result
+    baseConfig.Profiles = allProfiles;
+    var config = baseConfig;
+
     // Log what we loaded to help debug config issues
-    Log.Information("Loaded {ProfileCount} profile(s) from configuration", config.Profiles.Count);
+    Log.Information("Total {ProfileCount} profile(s) loaded after merge", config.Profiles.Count);
     foreach (var p in config.Profiles)
     {
         Log.Debug("  Profile '{Name}': {TableCount} tables", p.ProfileName, p.Tables.Count);

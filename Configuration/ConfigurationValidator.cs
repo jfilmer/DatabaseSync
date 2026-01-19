@@ -79,6 +79,15 @@ public static class ConfigurationValidator
             }
         }
 
+        // Validate external profiles configuration
+        if (config.EnableExternalProfiles)
+        {
+            if (string.IsNullOrWhiteSpace(config.ProfilesDirectory))
+            {
+                result.Warnings.Add("EnableExternalProfiles is true but ProfilesDirectory is empty. Will use default 'profiles' directory.");
+            }
+        }
+
         return result;
     }
 

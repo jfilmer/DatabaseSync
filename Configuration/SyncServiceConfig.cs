@@ -55,6 +55,17 @@ public class SyncServiceConfig
     public List<SyncProfile> Profiles { get; set; } = new();
 
     /// <summary>
+    /// Enable loading profiles from external JSON files in addition to inline profiles
+    /// </summary>
+    public bool EnableExternalProfiles { get; set; } = true;
+
+    /// <summary>
+    /// Directory containing external profile JSON files (relative to application directory)
+    /// Supports environment-specific directories: profiles.{Environment}/
+    /// </summary>
+    public string ProfilesDirectory { get; set; } = "profiles";
+
+    /// <summary>
     /// Startup delay in seconds before RunImmediatelyOnStart syncs begin.
     /// This provides a window to access the dashboard and trigger manual table syncs
     /// before automatic syncs start. Set to 0 for immediate start (default).

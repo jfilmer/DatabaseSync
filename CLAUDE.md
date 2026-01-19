@@ -166,6 +166,191 @@ A high-performance, standalone database synchronization service that supports **
 
 ---
 
+## External Profile Configuration
+
+For better maintainability and scalability, profiles can be stored in separate JSON files instead of embedding them in `appsettings.json`.
+
+### Benefits
+
+- **Cleaner configuration**: Main `appsettings.json` stays small and focused
+- **Easier maintenance**: One file per profile makes changes easier to track
+- **Version control friendly**: See exactly which profile changed in git diffs
+- **Environment-specific**: Different profile sets for dev/staging/prod
+- **Backward compatible**: Existing inline profiles continue working
+
+### Directory Structure
+
+```
+DatabaseSync/
+├── profiles/                    # Base profiles (all environments)
+│   ├── my-sync-1.json
+│   ├── my-sync-2.json
+│   └── reporting-sync.json
+├── profiles.Development/        # Development-only profiles (optional)
+│   └── local-test-sync.json
+├── profiles.Production/         # Production-only profiles (optional)
+│   └── prod-only-sync.json
+└── appsettings.json            # Main config + optional inline profiles
+```
+
+### External Profile File Format
+
+Each profile file contains a single `SyncProfile` object (not wrapped in an array):
+
+```json
+{
+  "ProfileName": "my-sync",
+  "Description": "SQL Server to PostgreSQL sync",
+  "SourceConnection": {
+    "Type": "SqlServer",
+    "ConnectionString": "Server=source.example.com;Database=MyDB;..."
+  },
+  "TargetConnection": {
+    "Type": "PostgreSql",
+    "ConnectionString": "Host=target.example.com;Database=mydb;..."
+  },
+  "Schedule": {
+    "StartTime": "06:00",
+    "IntervalMinutes": 60,
+    "RunImmediatelyOnStart": true,
+    "Enabled": true
+  },
+  "Options": {
+    "MaxParallelTables": 4,
+    "CommandTimeoutSeconds": 300
+  },
+  "Tables": [
+    {
+      "SourceTable": "Customers",
+      "TargetTable": "customers",
+      "Mode": "Incremental",
+      "TimestampColumn": "ModifiedDate",
+      "DeleteMode": "Sync"
+    }
+  ]
+}
+```
+
+### Configuration Settings
+
+Add to `appsettings.json`:
+
+```json
+{
+  "SyncService": {
+    "EnableExternalProfiles": true,
+    "ProfilesDirectory": "profiles",
+    "Profiles": []  // Optional inline profiles for backward compatibility
+  }
+}
+```
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `EnableExternalProfiles` | `true` | Enable loading profiles from external files |
+| `ProfilesDirectory` | `"profiles"` | Directory containing external profile JSON files |
+
+### Loading Order and Precedence
+
+Profiles are loaded with **last-wins** precedence:
+
+1. **Inline profiles** from `appsettings.json`
+2. **Base profiles** from `profiles/` directory
+3. **Environment-specific** from `profiles.{Environment}/` directory
+
+**Duplicate handling**: If the same `ProfileName` appears multiple times, the last-loaded profile wins. A warning is logged for each duplicate.
+
+**Example**: If you have a profile named "Production" in both `appsettings.json` and `profiles/Production.json`, the external file version will be used (and a warning logged).
+
+### Migration from Inline to External
+
+**Option 1: Keep inline (no changes required)**
+```json
+{
+  "SyncService": {
+    "EnableExternalProfiles": false,
+    "Profiles": [ /* existing profiles */ ]
+  }
+}
+```
+
+**Option 2: Move to external files**
+
+1. Create `profiles/` directory in the application root
+2. For each profile, create `profiles/{name}.json` with the profile content
+3. Remove the inline `Profiles` array from `appsettings.json` (or set to `[]`)
+4. Restart the service
+
+**Option 3: Hybrid approach (gradual migration)**
+
+Keep some profiles inline while adding new ones as external files. Both work simultaneously:
+
+```json
+{
+  "SyncService": {
+    "EnableExternalProfiles": true,
+    "ProfilesDirectory": "profiles",
+    "Profiles": [
+      {
+        "ProfileName": "legacy-sync",
+        "Description": "Old inline profile"
+        // ... rest of config
+      }
+    ]
+  }
+}
+```
+
+Plus external files in `profiles/` for new profiles.
+
+### Environment-Specific Profiles
+
+Create environment-specific directories to load different profiles per environment:
+
+- `profiles/` - Loaded in all environments
+- `profiles.Development/` - Loaded only in Development environment
+- `profiles.Production/` - Loaded only in Production environment
+- `profiles.Staging/` - Loaded only in Staging environment
+
+The environment is detected from `DOTNET_ENVIRONMENT` or `ASPNETCORE_ENVIRONMENT` environment variable.
+
+**Example use case**: Load a test profile only in Development:
+
+```bash
+# Create Development-only profile
+mkdir profiles.Development
+echo '{ "ProfileName": "dev-test", ... }' > profiles.Development/dev-test.json
+
+# Set environment (Linux/macOS)
+export DOTNET_ENVIRONMENT=Development
+
+# Set environment (Windows)
+set DOTNET_ENVIRONMENT=Development
+
+# Run service - dev-test profile will load
+dotnet run
+```
+
+### Error Handling
+
+External profile loading is designed to be resilient:
+
+| Error Type | Behavior | Log Level |
+|------------|----------|-----------|
+| Directory not found | Skip directory, continue | Warning |
+| File not readable | Skip file, continue | Error |
+| Invalid JSON | Skip file, continue | Error |
+| Missing ProfileName | Skip file, continue | Error |
+| Duplicate ProfileName | Use last-loaded, warn | Warning |
+
+**Philosophy**: One bad profile file shouldn't prevent other profiles from loading. All errors are logged but don't crash the service.
+
+### Validation
+
+After loading, all profiles (inline and external) are validated together. If a validation error occurs, the error message includes the profile name to help identify which file has the issue.
+
+---
+
 ## Features
 
 | Feature | Notes |
