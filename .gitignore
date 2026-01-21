@@ -40,6 +40,11 @@ Thumbs.db
 *.Local.json
 appsettings*.json
 
+# Profile configurations (contain connection strings)
+profiles/
+profiles.Development/
+profiles.Production/
+
 # Publish output
 publish/
 out/
