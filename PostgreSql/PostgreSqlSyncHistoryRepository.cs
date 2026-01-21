@@ -48,7 +48,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 duration_seconds DOUBLE PRECISION NOT NULL,
                 recent_rows_count BIGINT NOT NULL DEFAULT 0,
                 total_source_rows BIGINT NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT NOW()
+                created_datetime TIMESTAMP DEFAULT NOW()
             );
 
             CREATE INDEX IF NOT EXISTS idx_sync_history_profile_table

@@ -46,7 +46,7 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                     duration_seconds FLOAT NOT NULL,
                     recent_rows_count BIGINT NOT NULL DEFAULT 0,
                     total_source_rows BIGINT NOT NULL DEFAULT 0,
-                    created_at DATETIME2 DEFAULT GETUTCDATE()
+                    created_datetime DATETIME2 DEFAULT GETUTCDATE()
                 );
 
                 CREATE INDEX idx_sync_history_profile_table

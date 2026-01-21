@@ -943,7 +943,7 @@ The `TypeMapper` class handles type conversion between databases:
 
 ### Database User Conventions
 
-**Environment-specific users**: Database users are specific to their environment. The production database user (e.g., `setlistmanagerprod`) only exists in the production database, and the development database user (e.g., `setlistmanagerdev`) only exists in the development database. Do not attempt to use cross-environment credentials.
+**Environment-specific users**: Database users are specific to their environment. The production database user (e.g., `empprod`) only exists in the production database, and the development database user (e.g., `empdev`) only exists in the development database. Do not attempt to use cross-environment credentials.
 
 **Restricted permissions**: Sync users should have data manipulation privileges only (SELECT, INSERT, UPDATE, DELETE, TRUNCATE) but should NOT have schema modification privileges (CREATE, DROP). Tables should be owned by a separate admin user (e.g., `postgres` or `claude`), not by the sync user.
 
@@ -969,7 +969,7 @@ CREATE TABLE IF NOT EXISTS "_sync_history" (
     duration_seconds DOUBLE PRECISION NOT NULL,
     recent_rows_count BIGINT NOT NULL DEFAULT 0,
     total_source_rows BIGINT NOT NULL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT NOW()
+    created_datetime TIMESTAMP DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_history_profile_table ON "_sync_history" (profile_name, source_table);
