@@ -29,13 +29,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="profiles\**\*.json">
+    <Content Update="profiles\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
-    <Content Include="profiles.Development\**\*.json" Condition="'$(Configuration)' == 'Debug'">
+    <Content Update="profiles.Development\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </Content>
-    <Content Include="profiles.Production\**\*.json" Condition="'$(Configuration)' == 'Release'">
+    <Content Update="profiles.Production\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
