@@ -16,7 +16,7 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
     private readonly int _commandTimeout;
 
     public PostgreSqlSchemaAnalyzer(
-        string connectionString, 
+        string connectionString,
         ILogger<PostgreSqlSchemaAnalyzer> logger,
         int commandTimeout = 300)
     {
@@ -25,28 +25,54 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         _commandTimeout = commandTimeout;
     }
 
+    /// <summary>
+    /// Parse schema and table name from a potentially schema-qualified table name
+    /// </summary>
+    private (string schema, string table) ParseTableName(string tableName)
+    {
+        if (tableName.Contains('.'))
+        {
+            var parts = tableName.Split('.', 2);
+            return (parts[0], parts[1]);
+        }
+        return ("public", tableName);
+    }
+
+    /// <summary>
+    /// Format table name for SQL queries with proper schema qualification
+    /// </summary>
+    private string FormatTableNameForSql(string tableName)
+    {
+        var (schema, table) = ParseTableName(tableName);
+        return $"\"{schema}\".\"{table}\"";
+    }
+
     public async Task<List<string>> FindTablesAsync(string pattern)
     {
+        var (schema, tablePattern) = ParseTableName(pattern);
+
         const string sql = @"
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'public' 
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = @schemaName
                 AND table_type = 'BASE TABLE'
                 AND table_name LIKE @pattern
             ORDER BY table_name";
 
         await using var connection = new NpgsqlConnection(_connectionString);
         var results = await connection.QueryAsync<string>(
-            sql, 
-            new { pattern }, 
+            sql,
+            new { schemaName = schema, pattern = tablePattern },
             commandTimeout: _commandTimeout);
         return results.ToList();
     }
 
     public async Task<List<ColumnInfo>> GetTableSchemaAsync(string tableName)
     {
+        var (schema, table) = ParseTableName(tableName);
+
         const string sql = @"
-            SELECT 
+            SELECT
                 c.column_name AS ColumnName,
                 c.data_type AS DataType,
                 c.is_nullable = 'YES' AS IsNullable,
@@ -55,55 +81,58 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
                 c.numeric_scale AS Scale,
                 c.ordinal_position AS OrdinalPosition,
                 COALESCE(pk.is_pk, FALSE) AS IsPrimaryKey,
-                COALESCE(c.is_identity = 'YES', FALSE) AS IsIdentity
+                COALESCE(c.column_default LIKE 'nextval%', FALSE) AS IsIdentity
             FROM information_schema.columns c
             LEFT JOIN (
                 SELECT kcu.column_name, TRUE AS is_pk
                 FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu 
+                JOIN information_schema.key_column_usage kcu
                     ON tc.constraint_name = kcu.constraint_name
                     AND tc.table_schema = kcu.table_schema
-                WHERE tc.table_name = @tableName 
-                    AND tc.table_schema = 'public'
+                WHERE tc.table_name = @tableName
+                    AND tc.table_schema = @schemaName
                     AND tc.constraint_type = 'PRIMARY KEY'
             ) pk ON c.column_name = pk.column_name
             WHERE c.table_name = @tableName
-                AND c.table_schema = 'public'
+                AND c.table_schema = @schemaName
             ORDER BY c.ordinal_position";
 
         await using var connection = new NpgsqlConnection(_connectionString);
         var results = await connection.QueryAsync<ColumnInfo>(
-            sql, 
-            new { tableName }, 
+            sql,
+            new { tableName = table, schemaName = schema },
             commandTimeout: _commandTimeout);
-        
+
         var columns = results.ToList();
-        
+
         _logger.LogDebug(
-            "Found {Count} columns in PostgreSQL table {Table}", 
+            "Found {Count} columns in PostgreSQL table {Table}",
             columns.Count, tableName);
-        
+
         return columns;
     }
 
     public async Task<bool> TableExistsAsync(string tableName)
     {
+        var (schema, table) = ParseTableName(tableName);
+
         const string sql = @"
-            SELECT COUNT(1) FROM information_schema.tables 
-            WHERE table_name = @tableName 
-                AND table_schema = 'public' 
+            SELECT COUNT(1) FROM information_schema.tables
+            WHERE table_name = @tableName
+                AND table_schema = @schemaName
                 AND table_type = 'BASE TABLE'";
 
         await using var connection = new NpgsqlConnection(_connectionString);
         return await connection.ExecuteScalarAsync<int>(
-            sql, 
-            new { tableName }, 
+            sql,
+            new { tableName = table, schemaName = schema },
             commandTimeout: _commandTimeout) > 0;
     }
 
     public async Task<long> GetRowCountAsync(string tableName, string? whereClause = null)
     {
-        var sql = $"SELECT COUNT(*) FROM \"{tableName}\"";
+        var formattedTable = FormatTableNameForSql(tableName);
+        var sql = $"SELECT COUNT(*) FROM {formattedTable}";
         if (!string.IsNullOrEmpty(whereClause))
         {
             sql += $" WHERE {whereClause}";
@@ -115,7 +144,8 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
 
     public async Task<DateTime?> GetMaxTimestampAsync(string tableName, string timestampColumn)
     {
-        var sql = $"SELECT MAX(\"{timestampColumn.ToLower()}\") FROM \"{tableName}\"";
+        var formattedTable = FormatTableNameForSql(tableName);
+        var sql = $"SELECT MAX(\"{timestampColumn.ToLower()}\") FROM {formattedTable}";
 
         await using var connection = new NpgsqlConnection(_connectionString);
         return await connection.ExecuteScalarAsync<DateTime?>(
@@ -130,6 +160,8 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         int hoursBack,
         string? sourceFilter = null)
     {
+        var formattedTable = FormatTableNameForSql(tableName);
+
         // Build timestamp expression with optional COALESCE for fallback
         string timestampExpression;
         if (!string.IsNullOrEmpty(fallbackTimestampColumn))
@@ -149,7 +181,7 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
             whereClause = $"({sourceFilter}) AND {whereClause}";
         }
 
-        var sql = $"SELECT COUNT(*) FROM \"{tableName}\" WHERE {whereClause}";
+        var sql = $"SELECT COUNT(*) FROM {formattedTable} WHERE {whereClause}";
 
         await using var connection = new NpgsqlConnection(_connectionString);
         return await connection.ExecuteScalarAsync<long>(
@@ -166,11 +198,12 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         List<ColumnInfo> pkColumns,
         string? whereClause = null)
     {
+        var formattedTable = FormatTableNameForSql(tableName);
         var pkConcat = pkColumns.Count == 1
             ? $"CAST(\"{pkColumns[0].ColumnName.ToLower()}\" AS TEXT)"
             : $"CONCAT({string.Join(", '|', ", pkColumns.Select(c => $"CAST(\"{c.ColumnName.ToLower()}\" AS TEXT)"))})";
 
-        var sql = $"SELECT {pkConcat} AS pk_value FROM \"{tableName}\"";
+        var sql = $"SELECT {pkConcat} AS pk_value FROM {formattedTable}";
         if (!string.IsNullOrEmpty(whereClause))
         {
             sql += $" WHERE {whereClause}";
@@ -189,6 +222,7 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         List<ColumnInfo> pkColumns,
         IEnumerable<string> pkValuesToDelete)
     {
+        var formattedTable = FormatTableNameForSql(tableName);
         var pkList = pkValuesToDelete.ToList();
         if (!pkList.Any())
             return 0;
@@ -199,23 +233,17 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         if (pkColumns.Count == 1)
         {
             var pkColumn = pkColumns[0];
-            var sql = $"DELETE FROM \"{tableName}\" WHERE \"{pkColumn.ColumnName.ToLower()}\" = ANY(@pks)";
-
-            // Use properly typed arrays - Npgsql requires explicit array types for ANY()
-            var baseType = pkColumn.DataType.ToLower();
-            if (baseType.Contains('('))
-                baseType = baseType.Substring(0, baseType.IndexOf('('));
-
-            object parameters = baseType switch
+            var sql = $"DELETE FROM {formattedTable} WHERE \"{pkColumn.ColumnName.ToLower()}\" = ANY(@pks)";
+            
+            object[] typedPks = pkColumn.DataType.ToLower() switch
             {
-                "integer" or "int" or "int4" => new { pks = pkList.Select(int.Parse).ToArray() },
-                "bigint" or "int8" => new { pks = pkList.Select(long.Parse).ToArray() },
-                "smallint" or "int2" => new { pks = pkList.Select(short.Parse).ToArray() },
-                "uuid" => new { pks = pkList.Select(Guid.Parse).ToArray() },
-                _ => new { pks = pkList.ToArray() }
+                "integer" or "int" => pkList.Select(int.Parse).Cast<object>().ToArray(),
+                "bigint" => pkList.Select(long.Parse).Cast<object>().ToArray(),
+                "uuid" => pkList.Select(Guid.Parse).Cast<object>().ToArray(),
+                _ => pkList.Cast<object>().ToArray()
             };
 
-            return await connection.ExecuteAsync(sql, parameters, commandTimeout: _commandTimeout);
+            return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
         }
         else
         {
@@ -239,7 +267,7 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
                             parameters.Add($"p{i}", parts[i]);
                         }
 
-                        var sql = $"DELETE FROM \"{tableName}\" WHERE {string.Join(" AND ", conditions)}";
+                        var sql = $"DELETE FROM {formattedTable} WHERE {string.Join(" AND ", conditions)}";
                         totalDeleted += await connection.ExecuteAsync(
                             sql, parameters, transaction, _commandTimeout);
                     }

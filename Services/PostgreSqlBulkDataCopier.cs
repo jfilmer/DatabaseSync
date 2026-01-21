@@ -46,6 +46,28 @@ public class PostgreSqlBulkDataCopier
     }
 
     /// <summary>
+    /// Parse schema and table name from a potentially schema-qualified table name
+    /// </summary>
+    private (string schema, string table) ParseTableName(string tableName)
+    {
+        if (tableName.Contains('.'))
+        {
+            var parts = tableName.Split('.', 2);
+            return (parts[0], parts[1]);
+        }
+        return ("public", tableName);
+    }
+
+    /// <summary>
+    /// Format table name for SQL queries with proper schema qualification
+    /// </summary>
+    private string FormatTableNameForSql(string tableName)
+    {
+        var (schema, table) = ParseTableName(tableName);
+        return $"\"{schema}\".\"{table}\"";
+    }
+
+    /// <summary>
     /// Perform a bulk upsert: insert new rows, update existing rows
     /// </summary>
     /// <param name="skipDelete">If true, skip the delete phase (for two-phase sync where deletes run separately)</param>
@@ -65,7 +87,8 @@ public class PostgreSqlBulkDataCopier
                 $"Table {sourceTableName} has no primary key. Cannot perform upsert.");
         }
 
-        var insertColumns = columns.Where(c => !c.IsIdentity).ToList();
+        // Include ALL columns for insert (including identity columns to preserve source values)
+        var insertColumns = columns.ToList();
         var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
         var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
@@ -85,7 +108,8 @@ public class PostgreSqlBulkDataCopier
 
             // Build source query
             var sourceColumnList = string.Join(", ", insertColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
-            var sourceQuery = $"SELECT {sourceColumnList} FROM \"{sourceTableName}\"";
+            var formattedSourceTable = FormatTableNameForSql(sourceTableName);
+            var sourceQuery = $"SELECT {sourceColumnList} FROM {formattedSourceTable}";
 
             if (!string.IsNullOrEmpty(config.SourceFilter))
             {
@@ -107,8 +131,9 @@ public class PostgreSqlBulkDataCopier
             }
 
             // Get count before upsert
+            var formattedTargetTable = FormatTableNameForSql(targetTableName);
             var countBefore = await targetConn.ExecuteScalarAsync<long>(
-                $"SELECT COUNT(*) FROM \"{targetTableName}\"");
+                $"SELECT COUNT(*) FROM {formattedTargetTable}");
 
             // Execute upsert
             _logger.LogInformation("Executing upsert to target table...");
@@ -117,10 +142,13 @@ public class PostgreSqlBulkDataCopier
 
             // Calculate stats
             var countAfter = await targetConn.ExecuteScalarAsync<long>(
-                $"SELECT COUNT(*) FROM \"{targetTableName}\"");
+                $"SELECT COUNT(*) FROM {formattedTargetTable}");
 
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
+
+            // Reset sequences for identity columns to prevent future conflicts
+            await ResetSequencesAsync(targetConn, targetTableName, columns);
 
             // Handle synchronized deletes (unless skipDelete is true for two-phase sync)
             if (config.DeleteMode == DeleteMode.Sync && !skipDelete)
@@ -192,7 +220,8 @@ public class PostgreSqlBulkDataCopier
                 $"Table {sourceTableName} has no primary key. Cannot perform upsert.");
         }
 
-        var insertColumns = columns.Where(c => !c.IsIdentity).ToList();
+        // Include ALL columns for insert (including identity columns to preserve source values)
+        var insertColumns = columns.ToList();
         var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
         var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
@@ -231,7 +260,8 @@ public class PostgreSqlBulkDataCopier
                 whereClause += $" AND ({config.SourceFilter})";
             }
 
-            var sourceQuery = $"SELECT {sourceColumnList} FROM \"{sourceTableName}\" WHERE {whereClause}";
+            var formattedSourceTable = FormatTableNameForSql(sourceTableName);
+            var sourceQuery = $"SELECT {sourceColumnList} FROM {formattedSourceTable} WHERE {whereClause}";
 
             _logger.LogInformation("Loading rows changed since {LastSync}...", lastSyncTime);
 
@@ -248,17 +278,21 @@ public class PostgreSqlBulkDataCopier
                 return result;
             }
 
+            var formattedTargetTable = FormatTableNameForSql(targetTableName);
             var countBefore = await targetConn.ExecuteScalarAsync<long>(
-                $"SELECT COUNT(*) FROM \"{targetTableName}\"");
+                $"SELECT COUNT(*) FROM {formattedTargetTable}");
 
             await ExecuteUpsertAsync(targetConn, stagingTableName, targetTableName,
                 insertColumns, updateColumns, pkColumns);
 
             var countAfter = await targetConn.ExecuteScalarAsync<long>(
-                $"SELECT COUNT(*) FROM \"{targetTableName}\"");
+                $"SELECT COUNT(*) FROM {formattedTargetTable}");
 
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
+
+            // Reset sequences for identity columns to prevent future conflicts
+            await ResetSequencesAsync(targetConn, targetTableName, columns);
 
             // Handle synchronized deletes (full PK comparison)
             // For incremental sync, only perform deletes if SyncAllDeletes is enabled
@@ -287,9 +321,10 @@ public class PostgreSqlBulkDataCopier
 
     private async Task CreateStagingTableAsync(NpgsqlConnection conn, string stagingTableName, string targetTableName)
     {
+        var formattedTargetTable = FormatTableNameForSql(targetTableName);
         await conn.ExecuteAsync($@"
             CREATE TEMP TABLE ""{stagingTableName}""
-            (LIKE ""{targetTableName}"" INCLUDING DEFAULTS)",
+            (LIKE {formattedTargetTable} INCLUDING DEFAULTS)",
             commandTimeout: _commandTimeout);
     }
 
@@ -404,6 +439,7 @@ public class PostgreSqlBulkDataCopier
     {
         var insertColumnList = string.Join(", ", insertColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
         var pkColumnList = string.Join(", ", pkColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
+        var formattedTargetTable = FormatTableNameForSql(targetTable);
 
         string upsertSql;
 
@@ -413,7 +449,7 @@ public class PostgreSqlBulkDataCopier
                 updateColumns.Select(c => $"\"{c.ColumnName.ToLower()}\" = EXCLUDED.\"{c.ColumnName.ToLower()}\""));
 
             upsertSql = $@"
-                INSERT INTO ""{targetTable}"" ({insertColumnList})
+                INSERT INTO {formattedTargetTable} ({insertColumnList})
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO UPDATE SET {updateSetClause}";
@@ -421,13 +457,63 @@ public class PostgreSqlBulkDataCopier
         else
         {
             upsertSql = $@"
-                INSERT INTO ""{targetTable}"" ({insertColumnList})
+                INSERT INTO {formattedTargetTable} ({insertColumnList})
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO NOTHING";
         }
 
         await conn.ExecuteAsync(upsertSql, commandTimeout: _commandTimeout);
+    }
+
+    /// <summary>
+    /// Reset sequences for identity columns to prevent future ID conflicts
+    /// </summary>
+    private async Task ResetSequencesAsync(
+        NpgsqlConnection conn,
+        string tableName,
+        List<ColumnInfo> columns)
+    {
+        var (schema, table) = ParseTableName(tableName);
+        var identityColumns = columns.Where(c => c.IsIdentity).ToList();
+
+        if (!identityColumns.Any())
+            return;
+
+        foreach (var column in identityColumns)
+        {
+            try
+            {
+                // Query pg_get_serial_sequence to get the actual sequence name
+                var sequenceName = await conn.ExecuteScalarAsync<string>(
+                    "SELECT pg_get_serial_sequence(@tableName, @columnName)",
+                    new { tableName = $"{schema}.{table}", columnName = column.ColumnName.ToLower() },
+                    commandTimeout: _commandTimeout);
+
+                if (!string.IsNullOrEmpty(sequenceName))
+                {
+                    // Get max value from table
+                    var formattedTableName = FormatTableNameForSql(tableName);
+                    var maxValueSql = $"SELECT COALESCE(MAX(\"{column.ColumnName.ToLower()}\"), 0) FROM {formattedTableName}";
+                    var maxValue = await conn.ExecuteScalarAsync<long>(maxValueSql, commandTimeout: _commandTimeout);
+
+                    // Reset sequence to max + 1
+                    var resetSql = $"SELECT setval('{sequenceName}', {maxValue + 1}, false)";
+                    await conn.ExecuteAsync(resetSql, commandTimeout: _commandTimeout);
+
+                    _logger.LogDebug(
+                        "Reset sequence {Sequence} for column {Column} to {Value}",
+                        sequenceName, column.ColumnName, maxValue + 1);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Failed to reset sequence for {Table}.{Column}",
+                    tableName, column.ColumnName);
+                // Don't fail the entire sync if sequence reset fails
+            }
+        }
     }
 
     private async Task<long> SyncDeletesAsync(

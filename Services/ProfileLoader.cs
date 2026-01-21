@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using DatabaseSync.Configuration;
 using SerilogLogger = Serilog.ILogger;
 
@@ -89,12 +90,15 @@ public static class ProfileLoader
                 var fileName = Path.GetFileName(filePath);
                 var json = File.ReadAllText(filePath);
 
-                var profile = JsonSerializer.Deserialize<SyncProfile>(json, new JsonSerializerOptions
+                var options = new JsonSerializerOptions
                 {
                     PropertyNameCaseInsensitive = true,
                     ReadCommentHandling = JsonCommentHandling.Skip,
                     AllowTrailingCommas = true
-                });
+                };
+                options.Converters.Add(new JsonStringEnumConverter());
+
+                var profile = JsonSerializer.Deserialize<SyncProfile>(json, options);
 
                 if (profile == null)
                 {
