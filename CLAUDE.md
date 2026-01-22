@@ -379,6 +379,9 @@ After loading, all profiles (inline and external) are validated together. If a v
 | Batched MERGE for large tables | SQL Server targets batch MERGE in 1M row chunks for tables >1M rows |
 | NOLOCK hints (SQL Server) | Reduce blocking on source database with WITH (NOLOCK) |
 | Source row batching | Read source data in batches to reduce memory pressure |
+| WIN1252 encoding support | Auto-detect target encoding and sanitize Unicode characters |
+| Restricted table filtering | Automatically skip db_environment and _sync_history tables |
+| PostgreSQL array support | Handle text[], integer[], and other array types in sync |
 
 ---
 
@@ -676,6 +679,40 @@ Set to `0` to disable batching (stream all rows in single query).
     "MaxParallelTables": 2
   }
 }
+```
+
+---
+
+## Target Encoding Support (WIN1252)
+
+For PostgreSQL-to-PostgreSQL sync, the service automatically detects the target database's server encoding and handles character compatibility:
+
+**How it works:**
+1. On first connection, queries `SHOW server_encoding` to detect target encoding
+2. If target is not UTF8 (e.g., WIN1252), logs a warning
+3. During data transfer, characters outside the target encoding's range are replaced with `?`
+
+**WIN1252 specifics:**
+- WIN1252 is a single-byte encoding supporting characters 0x00-0xFF
+- Unicode characters above U+00FF (emojis, arrows, CJK, etc.) are replaced with `?`
+- This prevents encoding errors like: "character with byte sequence 0xf0 0x9f 0x8e in encoding UTF8 has no equivalent in encoding WIN1252"
+
+**No configuration required** - encoding detection and sanitization is automatic.
+
+---
+
+## Restricted Tables
+
+The following tables are automatically skipped during sync to prevent system table corruption:
+
+| Table | Reason |
+|-------|--------|
+| `db_environment` | Environment-specific settings that should not be synced |
+| `_sync_history` | Sync history tracking table managed by the service |
+
+These tables are filtered out regardless of whether they appear in the profile's table list. A warning is logged when tables are skipped:
+```
+Skipped 1 restricted tables (db_environment, _sync_history)
 ```
 
 ---
@@ -1034,4 +1071,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added single-instance enforcement via file lock; added batched MERGE for large tables (>1M rows) on SQL Server targets*
+*Last Updated: Added WIN1252 encoding support with character sanitization; added restricted table filtering (db_environment, _sync_history); added PostgreSQL array type support*

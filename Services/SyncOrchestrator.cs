@@ -39,6 +39,13 @@ public class SyncOrchestrator
     // Optional callback for progress updates (tableName, rowsProcessed, phase)
     private readonly Action<string, long, string>? _progressCallback;
 
+    // Tables that should never be synced (system tables)
+    private static readonly HashSet<string> RestrictedTableNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "db_environment",
+        "_sync_history"
+    };
+
     public SyncOrchestrator(
         SyncProfile profile,
         ILogger<SyncOrchestrator> logger,
@@ -488,8 +495,20 @@ public class SyncOrchestrator
             _logger.LogInformation("Using two-phase sync (upserts first, then deletes in reverse priority order)");
         }
 
-        // Group tables by priority
-        var tablesByPriority = _profile.Tables
+        // Filter out restricted tables (db_environment, _sync_history) and group by priority
+        var filteredTables = _profile.Tables
+            .Where(t => !IsRestrictedTable(t))
+            .ToList();
+
+        var skippedTables = _profile.Tables.Count - filteredTables.Count;
+        if (skippedTables > 0)
+        {
+            _logger.LogWarning(
+                "Skipped {Count} restricted tables (db_environment, _sync_history)",
+                skippedTables);
+        }
+
+        var tablesByPriority = filteredTables
             .OrderBy(t => t.Priority)
             .GroupBy(t => t.Priority)
             .ToList();
@@ -603,7 +622,7 @@ public class SyncOrchestrator
         {
             _logger.LogInformation("Phase 2: Processing deletes in reverse priority order...");
 
-            var tablesWithDeletes = _profile.Tables
+            var tablesWithDeletes = filteredTables
                 .Where(t => t.DeleteMode == DeleteMode.Sync)
                 .OrderByDescending(t => t.Priority)
                 .GroupBy(t => t.Priority)
@@ -933,6 +952,23 @@ CREATE TABLE [{tableName}] (
             _postgreSqlToPostgreSqlCopier.ProgressCallback = copierCallback;
         else if (_postgreSqlToSqlServerCopier != null)
             _postgreSqlToSqlServerCopier.ProgressCallback = copierCallback;
+    }
+
+    /// <summary>
+    /// Check if a table should be skipped (restricted system tables)
+    /// </summary>
+    private static bool IsRestrictedTable(TableConfig table)
+    {
+        // Extract table name without schema prefix
+        var sourceTableName = table.SourceTable.Contains('.')
+            ? table.SourceTable.Split('.').Last()
+            : table.SourceTable;
+        var targetTableName = table.TargetTable.Contains('.')
+            ? table.TargetTable.Split('.').Last()
+            : table.TargetTable;
+
+        return RestrictedTableNames.Contains(sourceTableName) ||
+               RestrictedTableNames.Contains(targetTableName);
     }
 
     /// <summary>

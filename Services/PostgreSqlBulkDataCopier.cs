@@ -19,6 +19,10 @@ public class PostgreSqlBulkDataCopier
     private readonly ILogger<PostgreSqlBulkDataCopier> _logger;
     private readonly int _commandTimeout;
 
+    // Cached target server encoding (detected on first connection)
+    private string? _targetServerEncoding;
+    private bool _targetEncodingDetected;
+
     /// <summary>
     /// Optional callback for progress updates (rowsProcessed)
     /// Called every 100,000 rows during bulk load
@@ -39,10 +43,28 @@ public class PostgreSqlBulkDataCopier
         ILogger<PostgreSqlBulkDataCopier> logger,
         int commandTimeout = 3600)
     {
-        _sourceConnectionString = sourceConnectionString;
-        _targetConnectionString = targetConnectionString;
+        // Ensure UTF8 encoding is set in connection strings to handle Unicode characters
+        _sourceConnectionString = EnsureUtf8Encoding(sourceConnectionString);
+        _targetConnectionString = EnsureUtf8Encoding(targetConnectionString);
         _logger = logger;
         _commandTimeout = commandTimeout;
+    }
+
+    /// <summary>
+    /// Ensures the connection string includes Options to set client_encoding=UTF8
+    /// </summary>
+    private static string EnsureUtf8Encoding(string connectionString)
+    {
+        // If already has Options or Encoding setting, don't modify
+        if (connectionString.Contains("Options=", StringComparison.OrdinalIgnoreCase) ||
+            connectionString.Contains("client_encoding", StringComparison.OrdinalIgnoreCase))
+        {
+            return connectionString;
+        }
+
+        // Append Options to set client_encoding to UTF8
+        var separator = connectionString.TrimEnd().EndsWith(";") ? "" : ";";
+        return $"{connectionString}{separator}Options=-c client_encoding=UTF8";
     }
 
     /// <summary>
@@ -99,6 +121,13 @@ public class PostgreSqlBulkDataCopier
 
         await sourceConn.OpenAsync();
         await targetConn.OpenAsync();
+
+        // Ensure UTF8 encoding for both connections to handle Unicode characters
+        await SetUtf8EncodingAsync(sourceConn);
+        await SetUtf8EncodingAsync(targetConn);
+
+        // Detect target server encoding for character sanitization
+        await DetectTargetEncodingAsync(targetConn);
 
         try
         {
@@ -196,6 +225,10 @@ public class PostgreSqlBulkDataCopier
         await sourceConn.OpenAsync();
         await targetConn.OpenAsync();
 
+        // Ensure UTF8 encoding for both connections to handle Unicode characters
+        await SetUtf8EncodingAsync(sourceConn);
+        await SetUtf8EncodingAsync(targetConn);
+
         return await SyncDeletesAsync(sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, sourceFilter);
     }
 
@@ -232,6 +265,13 @@ public class PostgreSqlBulkDataCopier
 
         await sourceConn.OpenAsync();
         await targetConn.OpenAsync();
+
+        // Ensure UTF8 encoding for both connections to handle Unicode characters
+        await SetUtf8EncodingAsync(sourceConn);
+        await SetUtf8EncodingAsync(targetConn);
+
+        // Detect target server encoding for character sanitization
+        await DetectTargetEncodingAsync(targetConn);
 
         try
         {
@@ -319,6 +359,76 @@ public class PostgreSqlBulkDataCopier
         return result;
     }
 
+    /// <summary>
+    /// Set UTF8 encoding for the connection to properly handle Unicode characters
+    /// </summary>
+    private async Task SetUtf8EncodingAsync(NpgsqlConnection conn)
+    {
+        // Set encoding explicitly
+        await using var setCmd = new NpgsqlCommand("SET client_encoding TO 'UTF8'", conn);
+        setCmd.CommandTimeout = _commandTimeout;
+        await setCmd.ExecuteNonQueryAsync();
+
+        // Verify encoding was set
+        await using var checkCmd = new NpgsqlCommand("SHOW client_encoding", conn);
+        checkCmd.CommandTimeout = _commandTimeout;
+        var encoding = await checkCmd.ExecuteScalarAsync() as string;
+        _logger.LogDebug("PostgreSQL client_encoding set to: {Encoding} on {Host}",
+            encoding, conn.Host);
+    }
+
+    /// <summary>
+    /// Detect the target server's encoding (cached after first call)
+    /// </summary>
+    private async Task DetectTargetEncodingAsync(NpgsqlConnection conn)
+    {
+        if (_targetEncodingDetected)
+            return;
+
+        await using var cmd = new NpgsqlCommand("SHOW server_encoding", conn);
+        cmd.CommandTimeout = _commandTimeout;
+        _targetServerEncoding = await cmd.ExecuteScalarAsync() as string;
+        _targetEncodingDetected = true;
+
+        if (!string.Equals(_targetServerEncoding, "UTF8", StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogWarning(
+                "Target database server encoding is {Encoding}. " +
+                "Characters not supported by this encoding will be replaced with '?'.",
+                _targetServerEncoding);
+        }
+    }
+
+    /// <summary>
+    /// Sanitize a string value for the target encoding.
+    /// For WIN1252 and other single-byte encodings, replaces unsupported Unicode characters.
+    /// </summary>
+    private string SanitizeForTargetEncoding(string value)
+    {
+        // If target is UTF8, no sanitization needed
+        if (string.Equals(_targetServerEncoding, "UTF8", StringComparison.OrdinalIgnoreCase))
+            return value;
+
+        // For WIN1252 and other single-byte encodings, replace characters outside the supported range
+        // WIN1252 supports: 0x00-0x7F (ASCII) and 0x80-0xFF (extended Latin with some gaps)
+        var result = new System.Text.StringBuilder(value.Length);
+        foreach (var c in value)
+        {
+            if (c <= 0xFF)
+            {
+                // Character is in the single-byte range
+                // WIN1252 has gaps at 0x81, 0x8D, 0x8F, 0x90, 0x9D but these are rarely used
+                result.Append(c);
+            }
+            else
+            {
+                // Character is outside single-byte range - replace with '?'
+                result.Append('?');
+            }
+        }
+        return result.ToString();
+    }
+
     private async Task CreateStagingTableAsync(NpgsqlConnection conn, string stagingTableName, string targetTableName)
     {
         var formattedTargetTable = FormatTableNameForSql(targetTableName);
@@ -343,6 +453,7 @@ public class PostgreSqlBulkDataCopier
             sourceQuery, parameters, commandTimeout: _commandTimeout);
 
         // Use text mode COPY for better type compatibility between PostgreSQL versions
+        // Note: client_encoding is set to UTF8 at connection open time
         await using var writer = await targetConn.BeginTextImportAsync(
             $"COPY \"{stagingTableName}\" ({targetColumnList}) FROM STDIN (FORMAT TEXT, NULL '\\N')");
 
@@ -381,6 +492,7 @@ public class PostgreSqlBulkDataCopier
                 {
                     // Handle JSONB columns
                     var strValue = jsonDoc.RootElement.GetRawText();
+                    strValue = SanitizeForTargetEncoding(strValue);
                     strValue = strValue.Replace("\\", "\\\\")
                                       .Replace("\t", "\\t")
                                       .Replace("\n", "\\n")
@@ -391,13 +503,20 @@ public class PostgreSqlBulkDataCopier
                          value.GetType().Name == "NpgsqlTsVector")
                 {
                     // Handle tsvector - use ToString() which returns proper tsvector format
-                    values[i] = value.ToString() ?? "";
+                    var strValue = value.ToString() ?? "";
+                    values[i] = SanitizeForTargetEncoding(strValue);
+                }
+                else if (value is Array arrayValue)
+                {
+                    // Handle PostgreSQL array types (text[], integer[], etc.)
+                    values[i] = FormatPostgresArray(arrayValue);
                 }
                 else if (value.GetType().FullName?.Contains("Npgsql") == true ||
                          value.GetType().FullName?.Contains("Json") == true)
                 {
                     // Handle other JSON/Npgsql types by converting to string
                     var strValue = System.Text.Json.JsonSerializer.Serialize(value);
+                    strValue = SanitizeForTargetEncoding(strValue);
                     strValue = strValue.Replace("\\", "\\\\")
                                       .Replace("\t", "\\t")
                                       .Replace("\n", "\\n")
@@ -408,6 +527,7 @@ public class PostgreSqlBulkDataCopier
                 {
                     // Escape special characters for COPY text format
                     var strValue = value.ToString() ?? "";
+                    strValue = SanitizeForTargetEncoding(strValue);
                     strValue = strValue.Replace("\\", "\\\\")
                                       .Replace("\t", "\\t")
                                       .Replace("\n", "\\n")
@@ -514,6 +634,54 @@ public class PostgreSqlBulkDataCopier
                 // Don't fail the entire sync if sequence reset fails
             }
         }
+    }
+
+    /// <summary>
+    /// Format a C# array as a PostgreSQL array literal for COPY text mode.
+    /// PostgreSQL array format: {element1,element2} with quoted elements for special chars.
+    /// Inside quoted elements, \ escapes \ and " (as \\ and \").
+    /// For COPY TEXT format, we must escape backslashes again (\ -> \\).
+    /// </summary>
+    private string FormatPostgresArray(Array array)
+    {
+        if (array.Length == 0)
+            return "{}";
+
+        var elements = new List<string>();
+        foreach (var element in array)
+        {
+            if (element == null)
+            {
+                elements.Add("NULL");
+            }
+            else
+            {
+                var str = element.ToString() ?? "";
+                // Sanitize for target encoding (handles WIN1252 etc.)
+                str = SanitizeForTargetEncoding(str);
+                // Check if element needs quoting
+                if (str.Contains('"') || str.Contains('\\') || str.Contains('{') ||
+                    str.Contains('}') || str.Contains(',') || str.Contains(' ') ||
+                    string.IsNullOrWhiteSpace(str))
+                {
+                    // Step 1: Escape for PostgreSQL array format
+                    // \ -> \\ and " -> \"
+                    str = str.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+                    // Step 2: Escape backslashes again for COPY TEXT format
+                    // Each \ becomes \\
+                    str = str.Replace("\\", "\\\\");
+
+                    elements.Add($"\"{str}\"");
+                }
+                else
+                {
+                    elements.Add(str);
+                }
+            }
+        }
+
+        return "{" + string.Join(",", elements) + "}";
     }
 
     private async Task<long> SyncDeletesAsync(
