@@ -50,6 +50,7 @@ public class ProfileGenerator
             var fkRelationships = await GetForeignKeyRelationshipsAsync(existingProfile.SourceConnection);
             _logger.LogInformation("Found {FkCount} foreign key relationships", fkRelationships.Count);
 
+
             // Build existing table config lookup (use first config if duplicates exist)
             var existingTableConfigs = existingProfile.Tables
                 .GroupBy(t => t.SourceTable.ToLower())
@@ -72,6 +73,7 @@ public class ProfileGenerator
                 var schemaFks = fkRelationships
                     .Where(fk => fk.SourceSchema.Equals(schemaName, StringComparison.OrdinalIgnoreCase))
                     .ToList();
+
 
                 // Calculate priorities based on FK dependencies
                 var tablePriorities = CalculatePriorities(tables, schemaFks);
@@ -240,19 +242,22 @@ public class ProfileGenerator
             await using var conn = new NpgsqlConnection(connection.ConnectionString);
             await conn.OpenAsync();
 
+            // Use pg_constraint directly for reliable FK detection
+            // Column aliases must match property names exactly (Dapper is case-sensitive)
             var query = @"
-                SELECT
-                    tc.table_schema AS source_schema,
-                    tc.table_name AS source_table,
-                    ccu.table_schema AS referenced_schema,
-                    ccu.table_name AS referenced_table
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.constraint_column_usage ccu
-                    ON tc.constraint_name = ccu.constraint_name
-                    AND tc.table_schema = ccu.table_schema
-                WHERE tc.constraint_type = 'FOREIGN KEY'
-                  AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
-                GROUP BY tc.table_schema, tc.table_name, ccu.table_schema, ccu.table_name";
+                SELECT DISTINCT
+                    nsp.nspname AS ""SourceSchema"",
+                    cl.relname AS ""SourceTable"",
+                    nsp2.nspname AS ""ReferencedSchema"",
+                    cl2.relname AS ""ReferencedTable""
+                FROM pg_constraint con
+                JOIN pg_class cl ON con.conrelid = cl.oid
+                JOIN pg_namespace nsp ON cl.relnamespace = nsp.oid
+                JOIN pg_class cl2 ON con.confrelid = cl2.oid
+                JOIN pg_namespace nsp2 ON cl2.relnamespace = nsp2.oid
+                WHERE con.contype = 'f'
+                  AND nsp.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+                ORDER BY ""SourceSchema"", ""SourceTable"", ""ReferencedTable""";
 
             relationships = (await conn.QueryAsync<FkRelationship>(query, commandTimeout: _commandTimeout)).ToList();
         }
