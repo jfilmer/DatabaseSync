@@ -752,6 +752,42 @@ Skipped 1 restricted tables (db_environment, _sync_history)
 
 ---
 
+## Automatic Unique Constraint Recovery
+
+When a unique constraint violation occurs (PostgreSQL error 23505), the service automatically attempts to recover by:
+
+1. **Detecting the constraint** - Parses the constraint name from the error
+2. **Finding constraint columns** - Queries `pg_index`/`pg_constraint` to identify columns
+3. **Deleting conflicts** - Removes target rows that conflict with incoming data
+4. **Retrying upsert** - Re-runs the upsert which now succeeds
+
+**Example log output:**
+```
+[WRN] Unique constraint violation on 'idx_events_source_unique' for table core.events. Attempting automatic recovery...
+[INF] Constraint 'idx_events_source_unique' involves columns: source_name, source_event_id
+[INF] Deleted 4,426 conflicting rows from core.events. Retrying upsert...
+[INF] Upsert retry succeeded after constraint recovery
+```
+
+**Safety limits:**
+- Only attempts recovery if table has fewer than 300,000 rows (configurable)
+- Only retries once to prevent infinite loops
+- Logs all actions for audit trail
+
+**Configuration:**
+The threshold can be adjusted in profile options (default: 300,000):
+```json
+{
+  "Options": {
+    "MaxRowsForConstraintRecovery": 300000
+  }
+}
+```
+
+Set to `0` to disable automatic recovery.
+
+---
+
 ## Incremental Sync Behavior
 
 | Scenario | Behavior |
@@ -1106,4 +1142,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added automatic timezone handling (SET TIME ZONE 'UTC') to prevent timestamp shifting between servers with different timezone settings*
+*Last Updated: Added automatic unique constraint violation recovery - detects conflicting rows, deletes them, and retries upsert*

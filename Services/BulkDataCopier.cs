@@ -41,6 +41,15 @@ public class BulkDataCopier
     /// </summary>
     public int SourceBatchSize { get; set; } = 100000;
 
+    /// <summary>
+    /// Maximum table row count for automatic unique constraint violation recovery.
+    /// If a unique constraint violation occurs and the table has fewer rows than this,
+    /// the service will attempt to delete conflicting rows and retry.
+    /// Set to 0 to disable automatic recovery.
+    /// Default: 300000 (300K rows)
+    /// </summary>
+    public int MaxRowsForConstraintRecovery { get; set; } = 300000;
+
     public BulkDataCopier(
         string sourceConnectionString,
         string targetConnectionString,
@@ -127,8 +136,8 @@ public class BulkDataCopier
 
             // Execute upsert
             _logger.LogInformation("Executing upsert to target table...");
-            await ExecuteUpsertAsync(targetConn, stagingTableName, targetTableName, 
-                insertColumns, updateColumns, pkColumns);
+            await ExecuteUpsertAsync(targetConn, stagingTableName, targetTableName,
+                insertColumns, updateColumns, pkColumns, result.RowsProcessed);
 
             // Calculate stats
             var countAfter = await targetConn.ExecuteScalarAsync<long>(
@@ -244,7 +253,7 @@ public class BulkDataCopier
                 $"SELECT COUNT(*) FROM \"{targetTableName}\"");
 
             await ExecuteUpsertAsync(targetConn, stagingTableName, targetTableName,
-                insertColumns, updateColumns, pkColumns);
+                insertColumns, updateColumns, pkColumns, result.RowsProcessed);
 
             var countAfter = await targetConn.ExecuteScalarAsync<long>(
                 $"SELECT COUNT(*) FROM \"{targetTableName}\"");
@@ -366,34 +375,207 @@ public class BulkDataCopier
         string targetTable,
         List<ColumnInfo> insertColumns,
         List<ColumnInfo> updateColumns,
-        List<ColumnInfo> pkColumns)
+        List<ColumnInfo> pkColumns,
+        long rowsInStaging = 0)
     {
         var insertColumnList = string.Join(", ", insertColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
         var pkColumnList = string.Join(", ", pkColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
 
-        string upsertSql;
+        string upsertSql = BuildUpsertSql(targetTable, stagingTable, insertColumnList, pkColumnList, updateColumns);
 
+        try
+        {
+            await conn.ExecuteAsync(upsertSql, commandTimeout: _commandTimeout);
+        }
+        catch (PostgresException ex) when (ex.SqlState == "23505") // unique_violation
+        {
+            // Attempt automatic recovery for unique constraint violations
+            await HandleUniqueConstraintViolationAsync(
+                conn, ex, stagingTable, targetTable,
+                insertColumnList, pkColumnList, updateColumns, rowsInStaging);
+        }
+    }
+
+    private string BuildUpsertSql(
+        string targetTable,
+        string stagingTable,
+        string insertColumnList,
+        string pkColumnList,
+        List<ColumnInfo> updateColumns)
+    {
         if (updateColumns.Any())
         {
             var updateSetClause = string.Join(", ",
                 updateColumns.Select(c => $"\"{c.ColumnName.ToLower()}\" = EXCLUDED.\"{c.ColumnName.ToLower()}\""));
 
-            upsertSql = $@"
+            return $@"
                 INSERT INTO ""{targetTable}"" ({insertColumnList})
                 SELECT {insertColumnList} FROM ""{stagingTable}""
-                ON CONFLICT ({pkColumnList}) 
+                ON CONFLICT ({pkColumnList})
                 DO UPDATE SET {updateSetClause}";
         }
         else
         {
-            upsertSql = $@"
+            return $@"
                 INSERT INTO ""{targetTable}"" ({insertColumnList})
                 SELECT {insertColumnList} FROM ""{stagingTable}""
-                ON CONFLICT ({pkColumnList}) 
+                ON CONFLICT ({pkColumnList})
                 DO NOTHING";
         }
+    }
 
-        await conn.ExecuteAsync(upsertSql, commandTimeout: _commandTimeout);
+    /// <summary>
+    /// Handle unique constraint violation by identifying the conflicting constraint,
+    /// deleting conflicting rows, and retrying the upsert.
+    /// </summary>
+    private async Task HandleUniqueConstraintViolationAsync(
+        NpgsqlConnection conn,
+        PostgresException ex,
+        string stagingTable,
+        string targetTable,
+        string insertColumnList,
+        string pkColumnList,
+        List<ColumnInfo> updateColumns,
+        long rowsInStaging)
+    {
+        var constraintName = ex.ConstraintName;
+
+        if (string.IsNullOrEmpty(constraintName))
+        {
+            _logger.LogError("Unique constraint violation but constraint name not available. Cannot recover.");
+            throw ex;
+        }
+
+        _logger.LogWarning(
+            "Unique constraint violation on '{Constraint}' for table {Table}. Attempting automatic recovery...",
+            constraintName, targetTable);
+
+        // Safety check: only attempt recovery for reasonably-sized tables
+        if (MaxRowsForConstraintRecovery > 0)
+        {
+            var targetRowCount = await conn.ExecuteScalarAsync<long>(
+                $"SELECT COUNT(*) FROM \"{targetTable}\"",
+                commandTimeout: _commandTimeout);
+
+            if (targetRowCount > MaxRowsForConstraintRecovery)
+            {
+                _logger.LogError(
+                    "Table {Table} has {RowCount:N0} rows, exceeding recovery threshold of {Threshold:N0}. " +
+                    "Automatic recovery disabled for safety. Please resolve the constraint violation manually.",
+                    targetTable, targetRowCount, MaxRowsForConstraintRecovery);
+                throw ex;
+            }
+        }
+
+        // Get the columns involved in the violated constraint
+        var constraintColumns = await GetConstraintColumnsAsync(conn, targetTable, constraintName);
+
+        if (!constraintColumns.Any())
+        {
+            _logger.LogError(
+                "Could not determine columns for constraint '{Constraint}'. Cannot recover.",
+                constraintName);
+            throw ex;
+        }
+
+        _logger.LogInformation(
+            "Constraint '{Constraint}' involves columns: {Columns}",
+            constraintName, string.Join(", ", constraintColumns));
+
+        // Delete conflicting rows from target
+        var deletedCount = await DeleteConflictingRowsAsync(
+            conn, stagingTable, targetTable, constraintColumns);
+
+        _logger.LogInformation(
+            "Deleted {Count:N0} conflicting rows from {Table}. Retrying upsert...",
+            deletedCount, targetTable);
+
+        // Retry the upsert
+        var upsertSql = BuildUpsertSql(targetTable, stagingTable, insertColumnList, pkColumnList, updateColumns);
+
+        try
+        {
+            await conn.ExecuteAsync(upsertSql, commandTimeout: _commandTimeout);
+            _logger.LogInformation("Upsert retry succeeded after constraint recovery");
+        }
+        catch (PostgresException retryEx) when (retryEx.SqlState == "23505")
+        {
+            _logger.LogError(
+                "Upsert still failing after recovery attempt. Constraint: {Constraint}. " +
+                "This may indicate multiple conflicting constraints or data issues.",
+                retryEx.ConstraintName);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Get the column names involved in a unique constraint or index.
+    /// </summary>
+    private async Task<List<string>> GetConstraintColumnsAsync(
+        NpgsqlConnection conn,
+        string tableName,
+        string constraintName)
+    {
+        // First try to find it as an index
+        var indexQuery = @"
+            SELECT a.attname as column_name
+            FROM pg_index i
+            JOIN pg_class c ON c.oid = i.indexrelid
+            JOIN pg_class t ON t.oid = i.indrelid
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(i.indkey)
+            WHERE c.relname = @constraintName
+              AND t.relname = @tableName
+            ORDER BY array_position(i.indkey, a.attnum)";
+
+        var columns = (await conn.QueryAsync<string>(
+            indexQuery,
+            new { constraintName, tableName },
+            commandTimeout: _commandTimeout)).ToList();
+
+        if (columns.Any())
+        {
+            return columns;
+        }
+
+        // If not found as index, try as a constraint
+        var constraintQuery = @"
+            SELECT a.attname as column_name
+            FROM pg_constraint c
+            JOIN pg_class t ON t.oid = c.conrelid
+            JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ANY(c.conkey)
+            WHERE c.conname = @constraintName
+              AND t.relname = @tableName
+            ORDER BY array_position(c.conkey, a.attnum)";
+
+        columns = (await conn.QueryAsync<string>(
+            constraintQuery,
+            new { constraintName, tableName },
+            commandTimeout: _commandTimeout)).ToList();
+
+        return columns;
+    }
+
+    /// <summary>
+    /// Delete rows from target table that would conflict with rows in staging
+    /// based on the specified constraint columns.
+    /// </summary>
+    private async Task<long> DeleteConflictingRowsAsync(
+        NpgsqlConnection conn,
+        string stagingTable,
+        string targetTable,
+        List<string> constraintColumns)
+    {
+        // Build the join condition on constraint columns
+        var joinCondition = string.Join(" AND ",
+            constraintColumns.Select(c => $"t.\"{c.ToLower()}\" = s.\"{c.ToLower()}\""));
+
+        var deleteSql = $@"
+            DELETE FROM ""{targetTable}"" t
+            USING ""{stagingTable}"" s
+            WHERE {joinCondition}";
+
+        var deleted = await conn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
+        return deleted;
     }
 
     /// <summary>
