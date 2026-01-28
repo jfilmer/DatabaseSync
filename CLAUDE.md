@@ -4,6 +4,15 @@
 
 ## Quick Start
 
+### System Instructions
+
+Please select from prodcution emp.core database
+
+SELECT note_id, category, title, content, status, priority, related_app, tags, target_environments, completed_environments, created_datetime, updated_datetime, completed_datetime, last_read_datetime, plan, linked_note_id
+	FROM core.dev_notes WHERE category='system' AND (related_app='all' or related_app='databasesync');
+
+If necessary reference /mnt/devshare/ClaudeProjects/dev_docs_common/PostgreSQLConnectionInfo.txt to connect to db
+
 ### Run Locally
 ```bash
 dotnet run
@@ -701,6 +710,32 @@ For PostgreSQL-to-PostgreSQL sync, the service automatically detects the target 
 
 ---
 
+## Timezone Handling
+
+To prevent timestamps from being misinterpreted when syncing between servers with different timezone settings, the service automatically sets the PostgreSQL session timezone to UTC:
+
+**How it works:**
+1. Before any sync operation, `SET TIME ZONE 'UTC'` is executed on all PostgreSQL connections
+2. For `timestamptz` columns, values are read/written in UTC context regardless of server's default timezone
+3. For `timestamp` (naive) columns, values are preserved exactly as-is (no timezone conversion)
+4. UTC DateTime values include timezone offset when written to ensure correct interpretation
+
+**Why this matters:**
+- PostgreSQL interprets `timestamptz` values based on the session timezone setting
+- If source server is in EST and target is in UTC, timestamps could shift by 5 hours
+- By setting session timezone to UTC on both connections, values are interpreted consistently
+
+**Scenarios handled:**
+| Column Type | Behavior |
+|-------------|----------|
+| `timestamp without time zone` | Values preserved exactly as-is |
+| `timestamp with time zone` | Values normalized to UTC for consistent storage |
+| DateTime with `Kind.Utc` | Written with `+00` offset to prevent misinterpretation |
+
+**No configuration required** - timezone handling is automatic.
+
+---
+
 ## Restricted Tables
 
 The following tables are automatically skipped during sync to prevent system table corruption:
@@ -1071,4 +1106,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added WIN1252 encoding support with character sanitization; added restricted table filtering (db_environment, _sync_history); added PostgreSQL array type support*
+*Last Updated: Added automatic timezone handling (SET TIME ZONE 'UTC') to prevent timestamp shifting between servers with different timezone settings*

@@ -375,6 +375,14 @@ public class PostgreSqlBulkDataCopier
         var encoding = await checkCmd.ExecuteScalarAsync() as string;
         _logger.LogDebug("PostgreSQL client_encoding set to: {Encoding} on {Host}",
             encoding, conn.Host);
+
+        // Set timezone to UTC for consistent timestamp handling across servers
+        // This ensures timestamptz values are interpreted consistently regardless
+        // of the server's default timezone setting
+        await using var tzCmd = new NpgsqlCommand("SET TIME ZONE 'UTC'", conn);
+        tzCmd.CommandTimeout = _commandTimeout;
+        await tzCmd.ExecuteNonQueryAsync();
+        _logger.LogDebug("PostgreSQL session timezone set to UTC on {Host}", conn.Host);
     }
 
     /// <summary>
@@ -472,11 +480,22 @@ public class PostgreSqlBulkDataCopier
                 else if (value is DateTime dt)
                 {
                     // Format timestamp for PostgreSQL
-                    values[i] = dt.ToString("yyyy-MM-dd HH:mm:ss.ffffff");
+                    // IMPORTANT: Preserve timezone info for UTC timestamps to prevent
+                    // misinterpretation when target server has different timezone settings
+                    if (dt.Kind == DateTimeKind.Utc)
+                    {
+                        // UTC timestamps should include timezone offset to ensure correct storage
+                        values[i] = dt.ToString("yyyy-MM-dd HH:mm:ss.ffffff") + "+00";
+                    }
+                    else
+                    {
+                        // Local or Unspecified - write as naive timestamp
+                        values[i] = dt.ToString("yyyy-MM-dd HH:mm:ss.ffffff");
+                    }
                 }
                 else if (value is DateTimeOffset dto)
                 {
-                    // Format timestamptz for PostgreSQL
+                    // Format timestamptz for PostgreSQL with timezone offset
                     values[i] = dto.ToString("yyyy-MM-dd HH:mm:ss.ffffffzzz");
                 }
                 else if (value is bool b)

@@ -87,6 +87,9 @@ public class BulkDataCopier
         await sourceConn.OpenAsync();
         await targetConn.OpenAsync();
 
+        // Set timezone to UTC for consistent timestamp handling
+        await SetTimezoneUtcAsync(targetConn);
+
         try
         {
             // Create staging table
@@ -190,6 +193,9 @@ public class BulkDataCopier
         await sourceConn.OpenAsync();
         await targetConn.OpenAsync();
 
+        // Set timezone to UTC for consistent timestamp handling
+        await SetTimezoneUtcAsync(targetConn);
+
         try
         {
             await CreateStagingTableAsync(targetConn, stagingTableName, targetTableName);
@@ -273,10 +279,21 @@ public class BulkDataCopier
     private async Task CreateStagingTableAsync(NpgsqlConnection conn, string stagingTableName, string targetTableName)
     {
         await conn.ExecuteAsync($@"
-            CREATE TEMP TABLE ""{stagingTableName}"" 
+            CREATE TEMP TABLE ""{stagingTableName}""
             (LIKE ""{targetTableName}"" INCLUDING DEFAULTS)
             ON COMMIT DROP",
             commandTimeout: _commandTimeout);
+    }
+
+    /// <summary>
+    /// Set session timezone to UTC for consistent timestamp handling.
+    /// This ensures timestamptz values are written consistently regardless of
+    /// the target server's default timezone setting.
+    /// </summary>
+    private async Task SetTimezoneUtcAsync(NpgsqlConnection conn)
+    {
+        await conn.ExecuteAsync("SET TIME ZONE 'UTC'", commandTimeout: _commandTimeout);
+        _logger.LogDebug("PostgreSQL session timezone set to UTC");
     }
 
     private async Task<long> BulkLoadToStagingAsync(
