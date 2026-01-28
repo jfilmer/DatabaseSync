@@ -51,3 +51,11 @@ profiles.Production/
 # Publish output
 publish/
 out/
+
+# Temporary reports and docs
+CHECK_CONNECTIONS.md
+DATABASE_CONNECTIONS_REPORT.md
+devdocs/
+
+# Package files
+*.deb
