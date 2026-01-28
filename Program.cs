@@ -467,6 +467,51 @@ try
         });
     }).WithName("RenameProfile");
 
+    // Admin: Generate complete profile from source database schema
+    app.MapPost("/admin/generate-profile/{profileName}", async (
+        string profileName,
+        ProfileScheduler scheduler,
+        ILoggerFactory loggerFactory) =>
+    {
+        var profile = scheduler.GetProfile(profileName);
+        if (profile == null)
+        {
+            return Results.NotFound(new { Error = $"Profile '{profileName}' not found" });
+        }
+
+        var generator = new ProfileGenerator(
+            loggerFactory.CreateLogger<ProfileGenerator>());
+
+        // Get the profiles directory (same location as current profiles)
+        var profilesDir = Path.Combine(AppContext.BaseDirectory, "profiles");
+
+        var result = await generator.GenerateProfileAsync(profile, profilesDir);
+
+        if (result.Success)
+        {
+            Log.Information(
+                "Generated profile(s) for '{ProfileName}': {FileCount} files, {TableCount} tables",
+                profileName, result.GeneratedFiles.Count, result.TablesGenerated);
+
+            return Results.Ok(new
+            {
+                Success = true,
+                ProfileName = profileName,
+                FilesGenerated = result.GeneratedFiles.Select(Path.GetFileName).ToList(),
+                TablesGenerated = result.TablesGenerated,
+                OutputDirectory = Path.Combine(profilesDir, "_generated")
+            });
+        }
+        else
+        {
+            return Results.BadRequest(new
+            {
+                Success = false,
+                Error = result.Error
+            });
+        }
+    }).WithName("GenerateProfile");
+
     // ══════════════════════════════════════════════════════════════
     // Start the application
     // ══════════════════════════════════════════════════════════════
@@ -986,8 +1031,91 @@ static string GenerateProfileDashboardHtml(
         .sync-btn {{ background: #0f3460; color: #00d9ff; border: 1px solid #00d9ff; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 0.85em; }}
         .sync-btn:hover {{ background: #00d9ff; color: #0f3460; }}
         .sync-btn:disabled {{ background: #333; color: #666; border-color: #666; cursor: not-allowed; }}
+        .generate-btn {{ background: #0f3460; color: #28a745; border: 1px solid #28a745; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-size: 0.9em; margin-left: 15px; }}
+        .generate-btn:hover {{ background: #28a745; color: #0f3460; }}
+        .generate-btn:disabled {{ background: #333; color: #666; border-color: #666; cursor: not-allowed; }}
+        .header-actions {{ display: flex; align-items: center; margin-top: 10px; gap: 10px; }}
+        .result-box {{ background: #1a3a1a; border: 1px solid #28a745; border-radius: 4px; padding: 15px; margin-top: 15px; display: none; }}
+        .result-box.error {{ background: #3a1a1a; border-color: #dc3545; }}
+        .result-box h4 {{ margin-bottom: 10px; color: #28a745; }}
+        .result-box.error h4 {{ color: #dc3545; }}
+        .result-box ul {{ margin-left: 20px; }}
     </style>
     <script>
+        async function generateProfile(profileName) {{
+            const btn = event.target;
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'Generating...';
+
+            const resultBox = document.getElementById('generate-result');
+            resultBox.style.display = 'none';
+
+            try {{
+                const response = await fetch(`/admin/generate-profile/${{profileName}}`, {{ method: 'POST' }});
+                const result = await response.json();
+
+                if (response.ok && result.Success) {{
+                    btn.textContent = 'Done!';
+                    btn.style.background = '#28a745';
+                    btn.style.borderColor = '#28a745';
+                    btn.style.color = '#fff';
+
+                    resultBox.className = 'result-box';
+                    resultBox.innerHTML = `
+                        <h4>Profile Generated Successfully</h4>
+                        <p><strong>Tables:</strong> ${{result.TablesGenerated}}</p>
+                        <p><strong>Files:</strong></p>
+                        <ul>${{result.FilesGenerated.map(f => `<li>${{f}}</li>`).join('')}}</ul>
+                        <p style=""margin-top: 10px; color: #888; font-size: 0.9em;"">
+                            Output: ${{result.OutputDirectory}}
+                        </p>
+                    `;
+                    resultBox.style.display = 'block';
+
+                    setTimeout(() => {{
+                        btn.textContent = originalText;
+                        btn.style.background = '';
+                        btn.style.borderColor = '';
+                        btn.style.color = '';
+                        btn.disabled = false;
+                    }}, 3000);
+                }} else {{
+                    btn.textContent = 'Failed';
+                    btn.style.background = '#dc3545';
+                    btn.style.borderColor = '#dc3545';
+                    btn.style.color = '#fff';
+
+                    resultBox.className = 'result-box error';
+                    resultBox.innerHTML = `<h4>Generation Failed</h4><p>${{result.Error || 'Unknown error'}}</p>`;
+                    resultBox.style.display = 'block';
+
+                    setTimeout(() => {{
+                        btn.textContent = originalText;
+                        btn.style.background = '';
+                        btn.style.borderColor = '';
+                        btn.style.color = '';
+                        btn.disabled = false;
+                    }}, 3000);
+                }}
+            }} catch (err) {{
+                btn.textContent = 'Error';
+                btn.style.background = '#dc3545';
+                btn.style.borderColor = '#dc3545';
+
+                resultBox.className = 'result-box error';
+                resultBox.innerHTML = `<h4>Request Failed</h4><p>${{err.message}}</p>`;
+                resultBox.style.display = 'block';
+
+                setTimeout(() => {{
+                    btn.textContent = originalText;
+                    btn.style.background = '';
+                    btn.style.borderColor = '';
+                    btn.disabled = false;
+                }}, 3000);
+            }}
+        }}
+
         async function triggerSync(profile, table) {{
             const btn = event.target;
             const originalText = btn.textContent;
@@ -1041,6 +1169,13 @@ static string GenerateProfileDashboardHtml(
         <a href=""/dashboard"" class=""back-link"">← Back to Dashboard</a>
         <h1>{System.Web.HttpUtility.HtmlEncode(profile.ProfileName)}</h1>
         <p class=""subtitle"">{System.Web.HttpUtility.HtmlEncode(profile.Description ?? "")} | {profile.TableCount} tables | {System.Web.HttpUtility.HtmlEncode(profile.ScheduleDescription)}</p>
+        <div class=""header-actions"">
+            <button class=""generate-btn"" onclick=""generateProfile('{System.Web.HttpUtility.JavaScriptStringEncode(profile.ProfileName)}')"">
+                Generate Complete Profile
+            </button>
+            <span style=""color: #888; font-size: 0.85em;"">Analyzes source DB schema and FK relationships to create optimized sync profile</span>
+        </div>
+        <div id=""generate-result"" class=""result-box""></div>
     </div>
 
     <div class=""stats"">

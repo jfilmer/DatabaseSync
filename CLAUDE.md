@@ -34,6 +34,7 @@ The dashboard opens automatically at `http://localhost:5123/dashboard`
 | GET | `/history/{profile}` | Sync history (JSON) |
 | GET | `/dashboard` | HTML Dashboard |
 | GET | `/dashboard/{profile}` | Profile Dashboard |
+| POST | `/admin/generate-profile/{profile}` | Generate complete sync profiles for all schemas |
 
 ### Trigger Sync via API
 ```bash
@@ -391,6 +392,7 @@ After loading, all profiles (inline and external) are validated together. If a v
 | WIN1252 encoding support | Auto-detect target encoding and sanitize Unicode characters |
 | Restricted table filtering | Automatically skip db_environment and _sync_history tables |
 | PostgreSQL array support | Handle text[], integer[], and other array types in sync |
+| Profile generator | Auto-generate complete sync profiles from source database schema |
 
 ---
 
@@ -1009,6 +1011,87 @@ Where:
 
 ---
 
+## Profile Generator
+
+The dashboard includes a "Generate Complete Profile" button that automatically creates optimized sync profiles by analyzing the source database schema.
+
+### What It Does
+
+1. **Discovers all schemas and tables** - Queries the source database for all user tables
+2. **Analyzes foreign key relationships** - Identifies dependencies between tables
+3. **Calculates priority levels** - Uses topological sort to assign priorities respecting FK order
+4. **Generates per-schema profiles** - Creates one JSON file per schema for easier management
+5. **Preserves existing settings** - Copies configuration from existing table entries
+
+### Generated Profile Settings
+
+Each generated profile uses these defaults:
+
+| Setting | Value | Reason |
+|---------|-------|--------|
+| Mode | `FullRefresh` | Ensures complete data sync |
+| DeleteMode | `Sync` | Mirrors source exactly |
+| SyncAllDeletes | `true` | Catches all deleted rows |
+| Priority | FK-based | Parent tables sync before children |
+| Schedule.Enabled | `false` | Requires manual review before enabling |
+
+### Output Location
+
+Generated profiles are saved to:
+```
+profiles/_generated/{profileName}-{schema}-full.json
+```
+
+Example: For profile `9-CORE-prodpgsql-devpgsql`, generates:
+- `9-CORE-prodpgsql-devpgsql-core-full.json` (34 tables)
+- `9-CORE-prodpgsql-devpgsql-cron-full.json` (2 tables)
+- `9-CORE-prodpgsql-devpgsql-emp-full.json` (3 tables)
+- `9-CORE-prodpgsql-devpgsql-nxs-full.json` (14 tables)
+- `9-CORE-prodpgsql-devpgsql-wgo-full.json` (41 tables)
+
+### Excluded Tables
+
+The generator automatically excludes:
+- System tables (`pg_*`, `information_schema.*`)
+- Sync history table (`_sync_history`)
+- Environment table (`db_environment`)
+
+### API Usage
+
+```bash
+# Generate profiles via API
+curl -X POST http://localhost:5123/admin/generate-profile/9-CORE-prodpgsql-devpgsql
+
+# Response
+{
+  "success": true,
+  "profileName": "9-CORE-prodpgsql-devpgsql",
+  "filesGenerated": [
+    "9-CORE-prodpgsql-devpgsql-core-full.json",
+    "9-CORE-prodpgsql-devpgsql-cron-full.json",
+    ...
+  ],
+  "totalTables": 94
+}
+```
+
+### Priority Calculation
+
+Tables are assigned priorities based on FK dependencies using topological sort:
+
+1. Tables with no FK dependencies get priority 1
+2. Tables that reference only priority-1 tables get priority 2
+3. Process continues until all tables have priorities
+
+**Example:**
+```
+users (priority 1) ← orders (priority 2) ← order_items (priority 3)
+```
+
+This ensures parent tables sync before their children, preventing FK constraint violations.
+
+---
+
 ## Architecture
 
 ### Bulk Copier Classes
@@ -1142,4 +1225,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added automatic unique constraint violation recovery - detects conflicting rows, deletes them, and retries upsert*
+*Last Updated: Added profile generator to auto-create complete sync profiles from source database schema with FK-based priority calculation*
