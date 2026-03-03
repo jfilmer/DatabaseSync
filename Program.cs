@@ -306,7 +306,7 @@ try
     {
         var results = new List<object>();
 
-        foreach (var status in scheduler.GetAllProfileStatus().Where(s => !s.IsRunning))
+        foreach (var status in scheduler.GetAllProfileStatus().Where(s => !s.IsRunning).OrderBy(s => s.ProfileName))
         {
             try
             {

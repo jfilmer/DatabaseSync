@@ -219,9 +219,11 @@ public class SyncOrchestrator
             // Verify source exists
             if (!await _sourceAnalyzer.TableExistsAsync(sourceTableNameForCheck))
             {
-                result.Success = false;
-                result.Error = $"Source table '{sourceTableNameForCheck}' not found";
-                _logger.LogError("Sync failed for {Table}: {Error}", tableConfig.SourceTable, result.Error);
+                result.Success = true;
+                result.Skipped = true;
+                result.Error = $"Source table '{sourceTableNameForCheck}' not found - skipped";
+                _logger.LogWarning("Skipping {Table}: source table '{SourceTable}' not found on {SourceType}",
+                    tableConfig.SourceTable, sourceTableNameForCheck, _sourceDatabaseType);
                 goto RecordHistory;
             }
 
@@ -256,9 +258,11 @@ public class SyncOrchestrator
                 }
                 else
                 {
-                    result.Success = false;
-                    result.Error = $"Target table '{targetTableName}' not found";
-                    _logger.LogError("Sync failed for {Table}: {Error}", tableConfig.SourceTable, result.Error);
+                    result.Success = true;
+                    result.Skipped = true;
+                    result.Error = $"Target table '{targetTableName}' not found - skipped";
+                    _logger.LogWarning("Skipping {Table}: target table '{TargetTable}' not found on {TargetType}",
+                        tableConfig.SourceTable, targetTableName, _targetDatabaseType);
                     goto RecordHistory;
                 }
             }
@@ -408,7 +412,7 @@ public class SyncOrchestrator
         // This counts rows with timestamp within last 168 hours (7 days)
         long recentRowsCount = 0;
         long totalSourceRows = 0;
-        if (result.Success && !string.IsNullOrEmpty(tableConfig.TimestampColumn))
+        if (result.Success && !result.Skipped && !string.IsNullOrEmpty(tableConfig.TimestampColumn))
         {
             try
             {
@@ -555,7 +559,7 @@ public class SyncOrchestrator
                     results.Add(result);
                     LogTableResult(result);
 
-                    if (!result.Success)
+                    if (!result.Success && !result.Skipped)
                         failedTables.Add(tableConfig.SourceTable);
                 }
             }
@@ -603,7 +607,7 @@ public class SyncOrchestrator
                             results.Add(result);
                             LogTableResult(result);
 
-                            if (!result.Success)
+                            if (!result.Success && !result.Skipped)
                                 failedTables.Add(config.SourceTable);
                         }
                         finally
@@ -687,19 +691,28 @@ public class SyncOrchestrator
 
     private void LogTableResult(SyncResult result)
     {
-        var status = result.Success ? "✓" : "✗";
-        var rate = result.Duration.TotalSeconds > 0
-            ? $"{result.RowsProcessed / result.Duration.TotalSeconds:N0} rows/sec"
-            : "N/A";
+        var status = result.Skipped ? "⊘" : result.Success ? "✓" : "✗";
 
-        _logger.LogInformation(
-            "{Status} {Table}: {Processed:N0} processed, {Inserted:N0} inserted, " +
-            "{Updated:N0} updated, {Deleted:N0} deleted ({Duration}, {Rate})",
-            status, result.TableName, result.RowsProcessed, result.RowsInserted,
-            result.RowsUpdated, result.RowsDeleted, FormatDuration(result.Duration), rate);
+        if (result.Skipped)
+        {
+            _logger.LogWarning("{Status} {Table}: {Reason}",
+                status, result.TableName, result.Error ?? "Skipped");
+        }
+        else
+        {
+            var rate = result.Duration.TotalSeconds > 0
+                ? $"{result.RowsProcessed / result.Duration.TotalSeconds:N0} rows/sec"
+                : "N/A";
 
-        if (!string.IsNullOrEmpty(result.Error))
-            _logger.LogError("  Error: {Error}", result.Error);
+            _logger.LogInformation(
+                "{Status} {Table}: {Processed:N0} processed, {Inserted:N0} inserted, " +
+                "{Updated:N0} updated, {Deleted:N0} deleted ({Duration}, {Rate})",
+                status, result.TableName, result.RowsProcessed, result.RowsInserted,
+                result.RowsUpdated, result.RowsDeleted, FormatDuration(result.Duration), rate);
+
+            if (!string.IsNullOrEmpty(result.Error))
+                _logger.LogError("  Error: {Error}", result.Error);
+        }
 
         foreach (var warning in result.Warnings)
             _logger.LogWarning("  Warning: {Warning}", warning);
@@ -707,11 +720,15 @@ public class SyncOrchestrator
 
     private void LogSyncSummary(SyncRunResult result)
     {
+        var skippedInfo = result.SkippedCount > 0
+            ? $", {result.SkippedCount} skipped"
+            : "";
+
         _logger.LogInformation(@"
 ═══════════════════════════════════════════════════════════════
   Profile: {ProfileName}
   Total Duration: {Duration}
-  Tables: {Success}/{Total} successful
+  Tables: {Success}/{Total} successful{Skipped}
 
   Rows: {Processed:N0} processed, {Inserted:N0} inserted,
         {Updated:N0} updated, {Deleted:N0} deleted
@@ -722,6 +739,7 @@ public class SyncOrchestrator
             FormatDuration(result.Duration),
             result.SuccessCount,
             result.TableResults.Count,
+            skippedInfo,
             result.TotalRowsProcessed,
             result.TotalRowsInserted,
             result.TotalRowsUpdated,

@@ -28,6 +28,14 @@ public class SqlServerBulkDataCopier
     public int MergeBatchSize { get; set; } = 1_000_000;
 
     /// <summary>
+    /// Maximum target table row count for automatic unique constraint recovery.
+    /// If the target table has more rows than this, recovery is skipped for safety.
+    /// Set to 0 to disable automatic recovery entirely.
+    /// Default: 300,000
+    /// </summary>
+    public int MaxRowsForConstraintRecovery { get; set; } = 300000;
+
+    /// <summary>
     /// Optional callback for progress updates (rowsProcessed)
     /// Called every 100,000 rows during bulk load
     /// </summary>
@@ -449,6 +457,32 @@ public class SqlServerBulkDataCopier
         List<ColumnInfo> pkColumns,
         bool hasIdentity)
     {
+        var mergeSql = BuildMergeSql(stagingTable, targetTable, insertColumns, updateColumns, pkColumns, hasIdentity);
+
+        try
+        {
+            var result = await conn.QueryFirstOrDefaultAsync<(long Inserted, long Updated)>(
+                mergeSql, commandTimeout: _commandTimeout);
+            return result;
+        }
+        catch (SqlException ex) when (ex.Number == 2601 || ex.Number == 2627)
+        {
+            // 2601: Cannot insert duplicate key row with unique index
+            // 2627: Violation of UNIQUE KEY constraint
+            return await HandleUniqueConstraintViolationAsync(
+                conn, ex, stagingTable, targetTable, insertColumns, updateColumns, pkColumns, hasIdentity);
+        }
+    }
+
+    private string BuildMergeSql(
+        string stagingTable,
+        string targetTable,
+        List<ColumnInfo> insertColumns,
+        List<ColumnInfo> updateColumns,
+        List<ColumnInfo> pkColumns,
+        bool hasIdentity,
+        string? stagingFilter = null)
+    {
         var insertColumnList = string.Join(", ", insertColumns.Select(c => $"[{c.ColumnName}]"));
 
         // For spatial columns, cast from varbinary back to geometry/geography
@@ -469,6 +503,10 @@ public class SqlServerBulkDataCopier
         {
             sqlBuilder.AppendLine($"SET IDENTITY_INSERT [{targetTable}] ON;");
         }
+
+        var usingClause = stagingFilter != null
+            ? $"(SELECT * FROM [{stagingTable}] WHERE {stagingFilter}) AS s"
+            : $"[{stagingTable}] AS s";
 
         if (updateColumns.Any())
         {
@@ -502,7 +540,7 @@ public class SqlServerBulkDataCopier
                 DECLARE @MergeOutput TABLE (Action NVARCHAR(10));
 
                 MERGE INTO [{targetTable}] AS t
-                USING [{stagingTable}] AS s
+                USING {usingClause}
                 ON {matchCondition}
                 WHEN MATCHED AND ({changeDetectionClause}) THEN
                     UPDATE SET {updateSetClause}
@@ -523,7 +561,7 @@ public class SqlServerBulkDataCopier
                 DECLARE @MergeOutput TABLE (Action NVARCHAR(10));
 
                 MERGE INTO [{targetTable}] AS t
-                USING [{stagingTable}] AS s
+                USING {usingClause}
                 ON {matchCondition}
                 WHEN NOT MATCHED THEN
                     INSERT ({insertColumnList})
@@ -542,9 +580,156 @@ public class SqlServerBulkDataCopier
             sqlBuilder.AppendLine($"SET IDENTITY_INSERT [{targetTable}] OFF;");
         }
 
-        var result = await conn.QueryFirstOrDefaultAsync<(long Inserted, long Updated)>(
-            sqlBuilder.ToString(), commandTimeout: _commandTimeout);
-        return result;
+        return sqlBuilder.ToString();
+    }
+
+    /// <summary>
+    /// Handle unique constraint violation by identifying conflicting index columns,
+    /// deleting conflicting rows from target, and retrying the MERGE.
+    /// </summary>
+    private async Task<(long Inserted, long Updated)> HandleUniqueConstraintViolationAsync(
+        SqlConnection conn,
+        SqlException ex,
+        string stagingTable,
+        string targetTable,
+        List<ColumnInfo> insertColumns,
+        List<ColumnInfo> updateColumns,
+        List<ColumnInfo> pkColumns,
+        bool hasIdentity)
+    {
+        // Parse the index/constraint name from the error message
+        // Error format: "...with unique index 'IndexName'..." or "...UNIQUE KEY constraint 'ConstraintName'..."
+        var indexName = ParseConstraintName(ex.Message);
+        if (string.IsNullOrEmpty(indexName))
+        {
+            _logger.LogError("Unique constraint violation but could not parse constraint name from: {Message}", ex.Message);
+            throw ex;
+        }
+
+        _logger.LogWarning(
+            "Unique constraint violation on '{Constraint}' for table {Table}. Attempting automatic recovery...",
+            indexName, targetTable);
+
+        // Safety check: only attempt recovery for reasonably-sized tables
+        if (MaxRowsForConstraintRecovery > 0)
+        {
+            var targetRowCount = await conn.ExecuteScalarAsync<long>(
+                $"SELECT COUNT(*) FROM [{targetTable}]",
+                commandTimeout: _commandTimeout);
+
+            if (targetRowCount > MaxRowsForConstraintRecovery)
+            {
+                _logger.LogError(
+                    "Table {Table} has {RowCount:N0} rows, exceeding recovery threshold of {Threshold:N0}. " +
+                    "Automatic recovery disabled for safety. Please resolve the constraint violation manually.",
+                    targetTable, targetRowCount, MaxRowsForConstraintRecovery);
+                throw ex;
+            }
+        }
+
+        // Get the columns involved in the violated constraint/index
+        var constraintColumns = await GetUniqueIndexColumnsAsync(conn, targetTable, indexName);
+        if (!constraintColumns.Any())
+        {
+            _logger.LogError("Could not determine columns for constraint '{Constraint}'. Cannot recover.", indexName);
+            throw ex;
+        }
+
+        _logger.LogInformation(
+            "Constraint '{Constraint}' involves columns: {Columns}",
+            indexName, string.Join(", ", constraintColumns));
+
+        // Delete conflicting rows from target where unique constraint columns match staging
+        var deletedCount = await DeleteConflictingRowsAsync(conn, stagingTable, targetTable, pkColumns, constraintColumns);
+
+        _logger.LogInformation(
+            "Deleted {Count:N0} conflicting rows from {Table}. Retrying MERGE...",
+            deletedCount, targetTable);
+
+        // Retry the MERGE
+        var mergeSql = BuildMergeSql(stagingTable, targetTable, insertColumns, updateColumns, pkColumns, hasIdentity);
+
+        try
+        {
+            var result = await conn.QueryFirstOrDefaultAsync<(long Inserted, long Updated)>(
+                mergeSql, commandTimeout: _commandTimeout);
+            _logger.LogInformation("MERGE retry succeeded after constraint recovery");
+            return result;
+        }
+        catch (SqlException retryEx) when (retryEx.Number == 2601 || retryEx.Number == 2627)
+        {
+            _logger.LogError(
+                "MERGE still failing after recovery attempt. Constraint: {Constraint}. " +
+                "This may indicate multiple conflicting constraints or data issues.",
+                ParseConstraintName(retryEx.Message));
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Parse the constraint or index name from a SQL Server unique constraint violation error message.
+    /// </summary>
+    private static string? ParseConstraintName(string message)
+    {
+        // Pattern 1: "with unique index 'IndexName'"
+        var match = System.Text.RegularExpressions.Regex.Match(message, @"unique index '([^']+)'");
+        if (match.Success) return match.Groups[1].Value;
+
+        // Pattern 2: "UNIQUE KEY constraint 'ConstraintName'"
+        match = System.Text.RegularExpressions.Regex.Match(message, @"constraint '([^']+)'");
+        if (match.Success) return match.Groups[1].Value;
+
+        return null;
+    }
+
+    /// <summary>
+    /// Get the column names involved in a unique index on a SQL Server table.
+    /// </summary>
+    private async Task<List<string>> GetUniqueIndexColumnsAsync(
+        SqlConnection conn,
+        string tableName,
+        string indexName)
+    {
+        var sql = @"
+            SELECT c.name AS ColumnName
+            FROM sys.indexes i
+            JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
+            JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+            WHERE i.name = @indexName
+              AND ic.is_included_column = 0
+            ORDER BY ic.key_ordinal";
+
+        var columns = (await conn.QueryAsync<string>(sql, new { indexName }, commandTimeout: _commandTimeout)).ToList();
+        return columns;
+    }
+
+    /// <summary>
+    /// Delete rows from target that conflict with staging data on unique constraint columns
+    /// but have different primary key values.
+    /// </summary>
+    private async Task<long> DeleteConflictingRowsAsync(
+        SqlConnection conn,
+        string stagingTable,
+        string targetTable,
+        List<ColumnInfo> pkColumns,
+        List<string> constraintColumns)
+    {
+        // Join on the unique constraint columns
+        var constraintJoin = string.Join(" AND ",
+            constraintColumns.Select(c => $"t.[{c}] = s.[{c}]"));
+
+        // But only delete where the PK is different (the conflicting rows)
+        var pkMismatch = string.Join(" OR ",
+            pkColumns.Select(c => $"t.[{c.ColumnName}] <> s.[{c.ColumnName}]"));
+
+        var deleteSql = $@"
+            DELETE t
+            FROM [{targetTable}] t
+            INNER JOIN [{stagingTable}] s ON {constraintJoin}
+            WHERE {pkMismatch}";
+
+        var rowsDeleted = await conn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
+        return rowsDeleted;
     }
 
     /// <summary>

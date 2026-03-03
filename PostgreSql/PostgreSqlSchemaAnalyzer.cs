@@ -234,16 +234,34 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         {
             var pkColumn = pkColumns[0];
             var sql = $"DELETE FROM {formattedTable} WHERE \"{pkColumn.ColumnName.ToLower()}\" = ANY(@pks)";
-            
-            object[] typedPks = pkColumn.DataType.ToLower() switch
-            {
-                "integer" or "int" => pkList.Select(int.Parse).Cast<object>().ToArray(),
-                "bigint" => pkList.Select(long.Parse).Cast<object>().ToArray(),
-                "uuid" => pkList.Select(Guid.Parse).Cast<object>().ToArray(),
-                _ => pkList.Cast<object>().ToArray()
-            };
 
-            return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
+            // Use strongly-typed arrays so Npgsql can infer the correct PostgreSQL type
+            var dataType = pkColumn.DataType.ToLower();
+            if (dataType is "integer" or "int" or "int4")
+            {
+                var typedPks = pkList.Select(int.Parse).ToArray();
+                return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
+            }
+            else if (dataType is "bigint" or "int8")
+            {
+                var typedPks = pkList.Select(long.Parse).ToArray();
+                return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
+            }
+            else if (dataType is "uuid")
+            {
+                var typedPks = pkList.Select(Guid.Parse).ToArray();
+                return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
+            }
+            else if (dataType is "smallint" or "int2")
+            {
+                var typedPks = pkList.Select(short.Parse).ToArray();
+                return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
+            }
+            else
+            {
+                var typedPks = pkList.ToArray();
+                return await connection.ExecuteAsync(sql, new { pks = typedPks }, commandTimeout: _commandTimeout);
+            }
         }
         else
         {
@@ -258,13 +276,13 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
                     foreach (var pkValue in batch)
                     {
                         var parts = pkValue.Split('|');
-                        var conditions = pkColumns.Select((col, idx) => 
+                        var conditions = pkColumns.Select((col, idx) =>
                             $"\"{col.ColumnName.ToLower()}\" = @p{idx}").ToList();
-                        
+
                         var parameters = new DynamicParameters();
                         for (int i = 0; i < parts.Length; i++)
                         {
-                            parameters.Add($"p{i}", parts[i]);
+                            parameters.Add($"p{i}", ConvertPkValue(parts[i], pkColumns[i].DataType));
                         }
 
                         var sql = $"DELETE FROM {formattedTable} WHERE {string.Join(" AND ", conditions)}";
@@ -283,5 +301,18 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
 
             return totalDeleted;
         }
+    }
+
+    private static object ConvertPkValue(string value, string dataType)
+    {
+        return dataType.ToLower() switch
+        {
+            "integer" or "int" or "int4" => int.Parse(value),
+            "bigint" or "int8" => long.Parse(value),
+            "smallint" or "int2" => short.Parse(value),
+            "uuid" => Guid.Parse(value),
+            "boolean" or "bool" => bool.Parse(value),
+            _ => value
+        };
     }
 }

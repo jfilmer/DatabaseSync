@@ -6,11 +6,6 @@
 
 ### System Instructions
 
-Please select from prodcution emp.core database
-
-SELECT note_id, category, title, content, status, priority, related_app, tags, target_environments, completed_environments, created_datetime, updated_datetime, completed_datetime, last_read_datetime, plan, linked_note_id
-	FROM core.dev_notes WHERE category='system' AND (related_app='all' or related_app='databasesync');
-
 If necessary reference /mnt/devshare/ClaudeProjects/dev_docs_common/PostgreSQLConnectionInfo.txt to connect to db
 
 ### Run Locally
@@ -84,6 +79,102 @@ sc delete DatabaseSync    # Uninstall (stop first)
 sudo cp database-sync.service /etc/systemd/system/
 sudo systemctl enable database-sync
 sudo systemctl start database-sync
+```
+
+### Deployment Environments
+
+| Server | Role | SSH | Service Path | Profiles |
+|--------|------|-----|-------------|----------|
+| **win2** (win2.digsol.us) | SQL Server syncs | `ssh claude@win2.digsol.us` | `C:\Services\DatabaseSync` | LMP_Main, LMP_Archive, LMP_Account (profiles 1-6) |
+| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10) |
+
+**Important**: Only deploy SQL Server profiles to win2 and PostgreSQL profiles to ubu2. Mixing causes errors (e.g., PG profiles on win2 fail trying to create `_sync_history` with restricted permissions).
+
+**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables.
+
+### Remote Deployment via SSH (win2)
+
+Build locally, deploy remotely. The `claude` user on win2 has admin privileges for service management.
+
+```bash
+# 1. Publish from the project directory (runs on local Linux machine)
+dotnet publish DatabaseSync.csproj -c Release -r win-x64 --self-contained true -o /tmp/DatabaseSync-publish
+
+# 2. Stop the service
+ssh claude@win2.digsol.us "sc stop DatabaseSync"
+
+# 3. Copy published files to win2
+scp -r /tmp/DatabaseSync-publish/* claude@win2.digsol.us:"C:/Services/DatabaseSync/"
+
+# 4. Copy profile configs (SQL Server profiles only, 1-6)
+scp profiles/[1-6]*.json claude@win2.digsol.us:"C:/Services/DatabaseSync/profiles/"
+
+# 5. Start the service
+ssh claude@win2.digsol.us "sc start DatabaseSync"
+
+# 6. Verify
+ssh claude@win2.digsol.us "sc query DatabaseSync"
+ssh claude@win2.digsol.us "curl -s http://localhost:5123/health"
+```
+
+**Logs on win2**: `D:\Logs\DatabaseSync\sync-YYYYMMDD.log`
+
+**Checking logs remotely**:
+```bash
+# Tail recent log entries
+ssh claude@win2.digsol.us "powershell -command \"Get-Content 'D:\Logs\DatabaseSync\sync-20260303.log' -Tail 30\""
+
+# Search for errors
+ssh claude@win2.digsol.us "powershell -command \"Select-String -Path 'D:\Logs\DatabaseSync\sync-20260303.log' -Pattern 'ERR|fail'\""
+```
+
+### Remote Deployment via SSH (ubu2)
+
+```bash
+# 1. Publish from the project directory (runs on local Linux machine)
+dotnet publish DatabaseSync.csproj -c Release -r linux-x64 --self-contained true -o /tmp/DatabaseSync-publish-linux
+
+# 2. Stop the service
+ssh claude@ubu2.digsol.us "sudo systemctl stop database-sync"
+
+# 3. Copy published files to ubu2 staging directory
+scp -r /tmp/DatabaseSync-publish-linux/* claude@ubu2.digsol.us:/tmp/DatabaseSync-deploy/
+
+# 4. Deploy binaries (exclude profiles/ to preserve existing configs on server)
+ssh claude@ubu2.digsol.us "sudo rsync -a --exclude 'profiles/' /tmp/DatabaseSync-deploy/ /opt/services/DatabaseSync/ && sudo chown -R www-data:www-data /opt/services/DatabaseSync/"
+
+# 5. Update profiles only when changed (PG profiles only, 7-10)
+scp profiles/[7-9]*.json profiles/10*.json claude@ubu2.digsol.us:/tmp/DatabaseSync-deploy/
+ssh claude@ubu2.digsol.us "sudo cp /tmp/DatabaseSync-deploy/*.json /opt/services/DatabaseSync/profiles/ && sudo chown www-data:www-data /opt/services/DatabaseSync/profiles/*.json"
+
+# 6. Start the service
+ssh claude@ubu2.digsol.us "sudo systemctl start database-sync"
+
+# 7. Verify
+ssh claude@ubu2.digsol.us "sudo systemctl is-active database-sync"
+ssh claude@ubu2.digsol.us "curl -s http://localhost:5123/health"
+```
+
+**Note**: The `rsync --exclude 'profiles/'` pattern prevents the build output's profiles directory (which may contain SQL Server profiles from the source tree) from overwriting the server's PG-only profiles. Always update profiles separately in step 5.
+
+**Logs on ubu2**: `/var/log/services/DatabaseSync/sync-YYYYMMDD.log`
+
+**Checking logs remotely**:
+```bash
+# Tail recent log entries
+ssh claude@ubu2.digsol.us "tail -30 /var/log/services/DatabaseSync/sync-20260303.log"
+
+# Search for errors
+ssh claude@ubu2.digsol.us "grep -E 'ERR|fail' /var/log/services/DatabaseSync/sync-20260303.log"
+```
+
+**Service management on ubu2**:
+```bash
+sudo systemctl stop database-sync     # Stop
+sudo systemctl start database-sync    # Start
+sudo systemctl restart database-sync  # Restart
+sudo systemctl status database-sync   # Status
+journalctl -u database-sync -f        # Follow live logs
 ```
 
 ---
@@ -393,6 +484,8 @@ After loading, all profiles (inline and external) are validated together. If a v
 | Restricted table filtering | Automatically skip db_environment and _sync_history tables |
 | PostgreSQL array support | Handle text[], integer[], and other array types in sync |
 | Profile generator | Auto-generate complete sync profiles from source database schema |
+| Graceful missing table handling | Skip missing source/target tables with warning instead of failing |
+| Alphabetical profile ordering | Profiles execute in sorted order for cross-schema FK dependencies |
 
 ---
 
@@ -756,14 +849,31 @@ Skipped 1 restricted tables (db_environment, _sync_history)
 
 ## Automatic Unique Constraint Recovery
 
-When a unique constraint violation occurs (PostgreSQL error 23505), the service automatically attempts to recover by:
+When a unique constraint violation occurs during upsert, the service automatically attempts to recover. This works for both **PostgreSQL** and **SQL Server** targets.
 
-1. **Detecting the constraint** - Parses the constraint name from the error
-2. **Finding constraint columns** - Queries `pg_index`/`pg_constraint` to identify columns
-3. **Deleting conflicts** - Removes target rows that conflict with incoming data
-4. **Retrying upsert** - Re-runs the upsert which now succeeds
+### How It Works
 
-**Example log output:**
+| Step | PostgreSQL Target | SQL Server Target |
+|------|-------------------|-------------------|
+| **Detect** | Catches error `23505` (unique_violation) | Catches SqlException `2601`/`2627` (duplicate key) |
+| **Parse** | Reads `ConstraintName` from `PostgresException` | Parses index name from error message via regex |
+| **Find columns** | Queries `pg_index`/`pg_constraint` | Queries `sys.indexes`/`sys.index_columns` |
+| **Delete conflicts** | Deletes target rows matching staging on constraint columns | Deletes target rows matching staging on constraint columns where PK differs |
+| **Retry** | Re-runs `INSERT ... ON CONFLICT` | Re-runs `MERGE` |
+
+### Example: SQL Server Recovery
+
+A common scenario: `tbl_Account_User` has PK on `AccountUserID` but also a unique index `UX_tbl_Account_User_ACountID_UserID` on `(AccountID, UserID)`. When source has a new row with the same `AccountID`+`UserID` but different PK, MERGE tries to INSERT and hits the unique index. Recovery deletes the stale target row and retries.
+
+```
+[WRN] Unique constraint violation on 'UX_tbl_Account_User_ACountID_UserID' for table tbl_Account_User. Attempting automatic recovery...
+[INF] Constraint 'UX_tbl_Account_User_ACountID_UserID' involves columns: AccountID, UserID
+[INF] Deleted 1 conflicting rows from tbl_Account_User. Retrying MERGE...
+[INF] MERGE retry succeeded after constraint recovery
+```
+
+### Example: PostgreSQL Recovery
+
 ```
 [WRN] Unique constraint violation on 'idx_events_source_unique' for table core.events. Attempting automatic recovery...
 [INF] Constraint 'idx_events_source_unique' involves columns: source_name, source_event_id
@@ -775,6 +885,8 @@ When a unique constraint violation occurs (PostgreSQL error 23505), the service 
 - Only attempts recovery if table has fewer than 300,000 rows (configurable)
 - Only retries once to prevent infinite loops
 - Logs all actions for audit trail
+
+**FK limitation:** When the constraint recovery deletes conflicting rows from the target, those deletes may fail if child tables have FK references to the conflicting rows. If this happens, truncate the target table (with `CASCADE` if needed) and re-sync from scratch. This typically only occurs on initial sync when target data is stale.
 
 **Configuration:**
 The threshold can be adjusted in profile options (default: 300,000):
@@ -962,6 +1074,89 @@ With this configuration:
 This ensures `order_items` referencing `orders` are deleted before the parent `orders` rows, and `orders` referencing `users` are deleted before the parent `users` rows.
 
 **Note:** Two-phase sync is automatic for PostgreSQL-to-PostgreSQL. Other database combinations handle deletes inline (within each table's sync operation).
+
+---
+
+## Profile Execution Order and Cross-Schema Dependencies
+
+### Profile Ordering
+
+When multiple profiles share a database and have cross-schema foreign key dependencies, **execution order matters**. Profiles are sorted alphabetically by `ProfileName` before execution, both for scheduled runs (`ProfileExecutionMode: Sequential`) and HTTP-triggered syncs (`POST /sync`).
+
+Use numbered prefixes to control execution order:
+
+```
+7-CORE-prodpgsql-devpgsql    ← Runs first  (core.users, core.events, core.talent, etc.)
+8-EMP-prodpgsql-devpgsql     ← Runs second (emp.user_event_assignments → core.events)
+9-NXS-prodpgsql-devpgsql     ← Runs third  (nxs.songs, nxs.setlists, etc.)
+10-WGO-prodpgsql-devpgsql    ← Runs last   (wgo.event_clicks → core.events)
+```
+
+### Cross-Schema FK Dependencies
+
+Tables in one schema often reference tables in another schema. These cross-schema FKs cannot be enforced by table priority within a single profile — they require the parent profile to complete first.
+
+**Current cross-schema dependencies:**
+
+| Child Table (schema) | Parent Table (schema) | Enforced By |
+|-----------------------|-----------------------|-------------|
+| `emp.user_event_assignments` | `core.events`, `core.users` | Profile order: CORE (7) before EMP (8) |
+| `wgo.event_clicks` | `core.events` | Profile order: CORE (7) before WGO (10) |
+| `wgo.raw_talent` | `core.talent` | Profile order: CORE (7) before WGO (10) |
+
+### Within-Profile Priority Assignment
+
+Within a profile, tables are ordered by `Priority` number based on FK dependencies. Use topological sort from FK relationships:
+
+1. Tables with no FK dependencies → Priority 1
+2. Tables referencing only P1 tables → Priority 2
+3. Continue until all tables have priorities
+
+**Example from WGO profile:**
+```
+P1: activity_types, occasions, event_categories         (no FKs)
+P2: scrape_sources, curated_lists, saved_searches       (FK to P1)
+P3: scrape_runs, subscriptions, event_category_map...   (FK to P2)
+P4: raw_venues, scrape_errors                           (FK to scrape_runs P3)
+P5: raw_events, venue_tags, user_activity_log           (FK to raw_venues P4)
+P6: raw_talent                                          (FK to raw_events P5)
+```
+
+**Common mistakes:**
+- Placing a child table at the same priority as its parent (they run in parallel and race)
+- Not accounting for self-referencing FKs (e.g., `raw_venues.parent_venue_id → raw_venues.raw_venue_id`)
+- Forgetting cross-schema dependencies when creating per-schema profiles
+
+---
+
+## Graceful Missing Table Handling
+
+When a source or target table doesn't exist (e.g., table was renamed, moved to another schema, or not yet created), the sync **skips** the table with a warning instead of failing.
+
+### Behavior
+
+| Scenario | Log Level | Status | Counts as Failure? |
+|----------|-----------|--------|-------------------|
+| Source table missing | Warning | Skipped (⊘) | No |
+| Target table missing | Warning | Skipped (⊘) | No |
+| Target missing + `CreateIfMissing: true` | Info | Created, then synced | No |
+| Other sync errors | Error | Failed (✗) | Yes |
+
+### Log Output
+
+```
+[WRN] ⊘ wgo.old_table: Source table 'wgo.old_table' not found - skipped
+[WRN] ⊘ wgo.new_table: Target table 'wgo.new_table' not found - skipped
+```
+
+### Summary Display
+
+Skipped tables appear separately in the sync summary:
+```
+Tables: 34/36 successful, 2 skipped
+```
+
+Skipped tables do **not** trigger `StopOnError` and do **not** cause the profile to report as failed. This allows schemas to evolve without breaking sync operations — update the profile when ready, and missing tables are safely ignored in the meantime.
 
 ---
 
@@ -1225,4 +1420,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added profile generator to auto-create complete sync profiles from source database schema with FK-based priority calculation*
+*Last Updated: Fixed delete type casting for PostgreSQL PKs; added alphabetical profile ordering for cross-schema FK deps; added graceful missing table handling (skip with warning); fixed WGO profile priorities for scrape chain; documented profile execution order and cross-schema dependencies*

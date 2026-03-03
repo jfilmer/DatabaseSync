@@ -73,7 +73,9 @@ public static class ProfileLoader
             return profiles;
         }
 
-        var jsonFiles = Directory.GetFiles(directory, "*.json");
+        var jsonFiles = Directory.GetFiles(directory, "*.json")
+            .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+            .ToArray();
 
         if (jsonFiles.Length == 0)
         {

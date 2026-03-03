@@ -14,7 +14,13 @@ public class SyncResult
     /// Whether the sync completed successfully
     /// </summary>
     public bool Success { get; set; }
-    
+
+    /// <summary>
+    /// Whether the table was skipped (e.g., source or target table missing)
+    /// Skipped tables are not counted as failures
+    /// </summary>
+    public bool Skipped { get; set; }
+
     /// <summary>
     /// Total rows processed from source
     /// </summary>
@@ -107,12 +113,17 @@ public class SyncRunResult
     /// <summary>
     /// Number of tables that synced successfully
     /// </summary>
-    public int SuccessCount => TableResults.Count(r => r.Success);
-    
+    public int SuccessCount => TableResults.Count(r => r.Success && !r.Skipped);
+
+    /// <summary>
+    /// Number of tables that were skipped (missing source/target)
+    /// </summary>
+    public int SkippedCount => TableResults.Count(r => r.Skipped);
+
     /// <summary>
     /// Number of tables that failed to sync
     /// </summary>
-    public int FailureCount => TableResults.Count(r => !r.Success);
+    public int FailureCount => TableResults.Count(r => !r.Success && !r.Skipped);
     
     /// <summary>
     /// Total rows processed across all tables
