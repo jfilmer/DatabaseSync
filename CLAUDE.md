@@ -86,11 +86,11 @@ sudo systemctl start database-sync
 | Server | Role | SSH | Service Path | Profiles |
 |--------|------|-----|-------------|----------|
 | **win2** (win2.digsol.us) | SQL Server syncs | `ssh claude@win2.digsol.us` | `C:\Services\DatabaseSync` | LMP_Main, LMP_Archive, LMP_Account (profiles 1-6) |
-| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10) |
+| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10); acx all schemas (profile 11) |
 
 **Important**: Only deploy SQL Server profiles to win2 and PostgreSQL profiles to ubu2. Mixing causes errors (e.g., PG profiles on win2 fail trying to create `_sync_history` with restricted permissions).
 
-**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables.
+**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO, 11-ACX) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables. ACX syncs independently (separate database).
 
 ### Remote Deployment via SSH (win2)
 
@@ -103,8 +103,8 @@ dotnet publish DatabaseSync.csproj -c Release -r win-x64 --self-contained true -
 # 2. Stop the service
 ssh claude@win2.digsol.us "sc stop DatabaseSync"
 
-# 3. Copy published files to win2
-scp -r /tmp/DatabaseSync-publish/* claude@win2.digsol.us:"C:/Services/DatabaseSync/"
+# 3. Copy published files to win2 (flat files only, excludes profiles/ directory)
+scp /tmp/DatabaseSync-publish/*.* claude@win2.digsol.us:"C:/Services/DatabaseSync/"
 
 # 4. Copy profile configs (SQL Server profiles only, 1-6)
 scp profiles/[1-6]*.json claude@win2.digsol.us:"C:/Services/DatabaseSync/profiles/"
@@ -116,6 +116,8 @@ ssh claude@win2.digsol.us "sc start DatabaseSync"
 ssh claude@win2.digsol.us "sc query DatabaseSync"
 ssh claude@win2.digsol.us "curl -s http://localhost:5123/health"
 ```
+
+**Important**: Step 3 uses `scp *.* ` (flat files only) instead of `scp -r` to prevent the `profiles/` directory (which contains all profiles including PG profiles 7-10) from being copied to win2. Never use `scp -r` for the full publish directory — it will deploy PG profiles to win2, causing the dashboard to show PostgreSQL schemas that belong on ubu2. Note: `rsync` is not available on win2's PATH, so use `scp` for file transfer.
 
 **Logs on win2**: `D:\Logs\DatabaseSync\sync-YYYYMMDD.log`
 
@@ -483,9 +485,12 @@ After loading, all profiles (inline and external) are validated together. If a v
 | WIN1252 encoding support | Auto-detect target encoding and sanitize Unicode characters |
 | Restricted table filtering | Automatically skip db_environment and _sync_history tables |
 | PostgreSQL array support | Handle text[], integer[], and other array types in sync |
+| GENERATED ALWAYS AS IDENTITY support | `OVERRIDING SYSTEM VALUE` clause for PG identity columns (backward-compatible with SERIAL) |
+| Unsupported type fallback | Gracefully handle extension types (e.g. pgvector `vector`) by reading as text |
 | Profile generator | Auto-generate complete sync profiles from source database schema |
 | Graceful missing table handling | Skip missing source/target tables with warning instead of failing |
 | Alphabetical profile ordering | Profiles execute in sorted order for cross-schema FK dependencies |
+| Target-side sequence reset | Queries target DB for sequences after sync to prevent duplicate key errors |
 
 ---
 
@@ -1089,7 +1094,8 @@ Use numbered prefixes to control execution order:
 7-CORE-prodpgsql-devpgsql    ← Runs first  (core.users, core.events, core.talent, etc.)
 8-EMP-prodpgsql-devpgsql     ← Runs second (emp.user_event_assignments → core.events)
 9-NXS-prodpgsql-devpgsql     ← Runs third  (nxs.songs, nxs.setlists, etc.)
-10-WGO-prodpgsql-devpgsql    ← Runs last   (wgo.event_clicks → core.events)
+10-WGO-prodpgsql-devpgsql    ← Runs fourth (wgo.event_clicks → core.events)
+11-ACX-prodpgsql-devpgsql    ← Runs last   (acx database, all schemas — independent)
 ```
 
 ### Cross-Schema FK Dependencies
@@ -1420,4 +1426,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Fixed delete type casting for PostgreSQL PKs; added alphabetical profile ordering for cross-schema FK deps; added graceful missing table handling (skip with warning); fixed WGO profile priorities for scrape chain; documented profile execution order and cross-schema dependencies*
+*Last Updated: Added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added unsupported type fallback (pgvector vector); added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*

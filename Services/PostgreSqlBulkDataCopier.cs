@@ -185,8 +185,8 @@ public class PostgreSqlBulkDataCopier
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
-            // Reset sequences for identity columns to prevent future conflicts
-            await ResetSequencesAsync(targetConn, targetTableName, columns);
+            // Reset sequences to prevent future ID conflicts
+            await ResetSequencesAsync(targetConn, targetTableName);
 
             // Handle synchronized deletes (unless skipDelete is true for two-phase sync)
             if (config.DeleteMode == DeleteMode.Sync && !skipDelete)
@@ -340,8 +340,8 @@ public class PostgreSqlBulkDataCopier
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
-            // Reset sequences for identity columns to prevent future conflicts
-            await ResetSequencesAsync(targetConn, targetTableName, columns);
+            // Reset sequences to prevent future ID conflicts
+            await ResetSequencesAsync(targetConn, targetTableName);
 
             // Handle synchronized deletes (full PK comparison)
             // For incremental sync, only perform deletes if SyncAllDeletes is enabled
@@ -480,7 +480,28 @@ public class PostgreSqlBulkDataCopier
 
             for (int i = 0; i < columns.Count; i++)
             {
-                var value = reader.GetValue(i);
+                object value;
+                try
+                {
+                    value = reader.GetValue(i);
+                }
+                catch (Exception)
+                {
+                    // Unsupported types (e.g. pgvector 'vector') - read as text representation
+                    if (reader.IsDBNull(i))
+                    {
+                        values[i] = "\\N";
+                        continue;
+                    }
+                    var strValue = reader.GetFieldValue<string>(i);
+                    strValue = SanitizeForTargetEncoding(strValue);
+                    strValue = strValue.Replace("\\", "\\\\")
+                                      .Replace("\t", "\\t")
+                                      .Replace("\n", "\\n")
+                                      .Replace("\r", "\\r");
+                    values[i] = strValue;
+                    continue;
+                }
 
                 if (value == DBNull.Value || value == null)
                 {
@@ -620,6 +641,7 @@ public class PostgreSqlBulkDataCopier
 
             return $@"
                 INSERT INTO {formattedTargetTable} ({insertColumnList})
+                OVERRIDING SYSTEM VALUE
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO UPDATE SET {updateSetClause}";
@@ -628,6 +650,7 @@ public class PostgreSqlBulkDataCopier
         {
             return $@"
                 INSERT INTO {formattedTargetTable} ({insertColumnList})
+                OVERRIDING SYSTEM VALUE
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO NOTHING";
@@ -806,52 +829,65 @@ public class PostgreSqlBulkDataCopier
     }
 
     /// <summary>
-    /// Reset sequences for identity columns to prevent future ID conflicts
+    /// Reset sequences for all columns that have associated sequences on the TARGET database.
+    /// Queries the target directly using pg_get_serial_sequence() instead of relying on
+    /// source IsIdentity flags, which may not detect all sequence-backed columns.
     /// </summary>
-    private async Task ResetSequencesAsync(
-        NpgsqlConnection conn,
-        string tableName,
-        List<ColumnInfo> columns)
+    private async Task ResetSequencesAsync(NpgsqlConnection conn, string tableName)
     {
         var (schema, table) = ParseTableName(tableName);
-        var identityColumns = columns.Where(c => c.IsIdentity).ToList();
+        var qualifiedName = $"{schema}.{table}";
+        var formattedTableName = FormatTableNameForSql(tableName);
 
-        if (!identityColumns.Any())
-            return;
-
-        foreach (var column in identityColumns)
+        try
         {
-            try
+            // Query target DB for all columns that have associated sequences
+            var sql = @"
+                SELECT c.column_name, pg_get_serial_sequence(@qualifiedName, c.column_name) AS sequence_name
+                FROM information_schema.columns c
+                WHERE c.table_schema = @schema AND c.table_name = @table
+                  AND pg_get_serial_sequence(@qualifiedName, c.column_name) IS NOT NULL";
+
+            var sequences = (await conn.QueryAsync(sql,
+                new { qualifiedName, schema, table },
+                commandTimeout: _commandTimeout)).ToList();
+
+            if (!sequences.Any())
+                return;
+
+            foreach (var seq in sequences)
             {
-                // Query pg_get_serial_sequence to get the actual sequence name
-                var sequenceName = await conn.ExecuteScalarAsync<string>(
-                    "SELECT pg_get_serial_sequence(@tableName, @columnName)",
-                    new { tableName = $"{schema}.{table}", columnName = column.ColumnName.ToLower() },
-                    commandTimeout: _commandTimeout);
-
-                if (!string.IsNullOrEmpty(sequenceName))
+                try
                 {
+                    string columnName = seq.column_name;
+                    string sequenceName = seq.sequence_name;
+
                     // Get max value from table
-                    var formattedTableName = FormatTableNameForSql(tableName);
-                    var maxValueSql = $"SELECT COALESCE(MAX(\"{column.ColumnName.ToLower()}\"), 0) FROM {formattedTableName}";
-                    var maxValue = await conn.ExecuteScalarAsync<long>(maxValueSql, commandTimeout: _commandTimeout);
+                    var maxValue = await conn.ExecuteScalarAsync<long>(
+                        $"SELECT COALESCE(MAX(\"{columnName}\"), 0) FROM {formattedTableName}",
+                        commandTimeout: _commandTimeout);
 
-                    // Reset sequence to max + 1
-                    var resetSql = $"SELECT setval('{sequenceName}', {maxValue + 1}, false)";
-                    await conn.ExecuteAsync(resetSql, commandTimeout: _commandTimeout);
+                    // Reset sequence: setval with false means next nextval() returns maxValue + 1
+                    await conn.ExecuteAsync(
+                        $"SELECT setval('{sequenceName}', {maxValue + 1}, false)",
+                        commandTimeout: _commandTimeout);
 
-                    _logger.LogDebug(
-                        "Reset sequence {Sequence} for column {Column} to {Value}",
-                        sequenceName, column.ColumnName, maxValue + 1);
+                    _logger.LogInformation(
+                        "Reset sequence {Sequence} to {Value} for {Table}.{Column}",
+                        sequenceName, maxValue + 1, tableName, columnName);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex,
+                        "Failed to reset sequence for {Table}.{Column}",
+                        tableName, (string)seq.column_name);
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "Failed to reset sequence for {Table}.{Column}",
-                    tableName, column.ColumnName);
-                // Don't fail the entire sync if sequence reset fails
-            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to query sequences for {Table}", tableName);
+            // Don't fail the entire sync if sequence reset fails
         }
     }
 
