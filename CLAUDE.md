@@ -8,6 +8,8 @@
 
 If necessary reference /mnt/devshare/ClaudeProjects/dev_docs_common/PostgreSQLConnectionInfo.txt to connect to db
 
+**On conversation start:** Offer to run a profile completeness audit (see [Profile Completeness Audit](#profile-completeness-audit) below). Tables get added/removed/renamed in prod as apps evolve, so profiles drift over time.
+
 ### Run Locally
 ```bash
 dotnet run
@@ -91,6 +93,8 @@ sudo systemctl start database-sync
 **Important**: Only deploy SQL Server profiles to win2 and PostgreSQL profiles to ubu2. Mixing causes errors (e.g., PG profiles on win2 fail trying to create `_sync_history` with restricted permissions).
 
 **Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO, 11-ACX) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables. ACX syncs independently (separate database).
+
+**TODO — RMP database sync**: Once the `rmp` database has been copied/migrated to ubu1 (production), a new sync profile (e.g., `12-RMP-prodpgsql-devpgsql`) will need to be created to sync it from prod to dev on ubu2. This is pending the RMP database setup on ubu1.
 
 ### Remote Deployment via SSH (win2)
 
@@ -178,6 +182,67 @@ sudo systemctl restart database-sync  # Restart
 sudo systemctl status database-sync   # Status
 journalctl -u database-sync -f        # Follow live logs
 ```
+
+---
+
+## Profile Completeness Audit
+
+Sync profiles drift over time as application schemas evolve — tables get added, renamed, or dropped in production. Run this audit periodically to keep profiles in sync with reality.
+
+### Process
+
+1. **Read each PG profile file** (`profiles/7-*.json` through `profiles/11-*.json`) to get the list of configured source tables per profile.
+
+2. **Query the production database** for all actual user tables per schema:
+   ```sql
+   -- For emp database (core, emp, nxs, wgo schemas):
+   SELECT table_schema || '.' || table_name
+   FROM information_schema.tables
+   WHERE table_type = 'BASE TABLE'
+     AND table_schema IN ('core', 'emp', 'nxs', 'wgo')
+   ORDER BY table_schema, table_name;
+
+   -- For acx database (all non-system schemas):
+   SELECT table_schema || '.' || table_name
+   FROM information_schema.tables
+   WHERE table_type = 'BASE TABLE'
+     AND table_schema NOT IN ('information_schema', 'pg_catalog')
+   ORDER BY table_schema, table_name;
+   ```
+   Use connection strings from the profile files themselves.
+
+3. **Compare** each profile's table list against the prod query results:
+   - **Missing tables**: Exist in prod but not in the profile (excluding restricted tables: `db_environment`, `_sync_history`, and EF migration tables like `__EFMigrationsHistory`)
+   - **Stale tables**: In the profile but no longer exist in prod (these get skipped with a warning during sync but add noise)
+
+4. **Assign priorities** for new tables using FK dependencies:
+   ```sql
+   -- Query FK relationships for new tables:
+   SELECT
+       ns.nspname || '.' || cl.relname AS child_table,
+       nsr.nspname || '.' || clr.relname AS parent_table
+   FROM pg_constraint c
+   JOIN pg_class cl ON c.conrelid = cl.oid
+   JOIN pg_namespace ns ON cl.relnamespace = ns.oid
+   JOIN pg_class clr ON c.confrelid = clr.oid
+   JOIN pg_namespace nsr ON clr.relnamespace = nsr.oid
+   WHERE c.contype = 'f'
+     AND ns.nspname || '.' || cl.relname IN (/* new tables */)
+   ORDER BY 1, 2;
+   ```
+   - Tables with no FKs or FKs only to Priority 1 tables → same priority as peers
+   - Tables with FKs to higher-priority tables → one level below their parent
+   - Cross-schema FKs (e.g., `wgo.promotions` → `core.users`) are handled by profile execution order, not within-profile priority
+
+5. **Update profiles**: Add missing tables, remove stale entries, deploy to ubu2, and verify table counts via the health API.
+
+### Restricted Tables (always excluded)
+
+| Table | Reason |
+|-------|--------|
+| `db_environment` | Environment-specific settings |
+| `_sync_history` | Managed by DatabaseSync service |
+| `__EFMigrationsHistory` | EF Core system table |
 
 ---
 
