@@ -191,6 +191,11 @@ public class ProfileGenerator
                   AND table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
                   AND table_name NOT LIKE 'pg_%'
                   AND table_name NOT IN ('_sync_history', 'db_environment')
+                  AND table_name NOT LIKE '%refresh_tokens'
+                  AND table_name NOT LIKE '%password_reset_tokens'
+                  AND table_name NOT LIKE '%email_verification_tokens'
+                  AND table_name NOT LIKE '%verification_tokens'
+                  AND table_name NOT LIKE '%sessions'
                 ORDER BY table_schema, table_name";
 
             var tables = await conn.QueryAsync<(string Schema, string Table)>(query, commandTimeout: _commandTimeout);
@@ -215,6 +220,11 @@ public class ProfileGenerator
                   AND s.name NOT IN ('sys', 'guest', 'INFORMATION_SCHEMA')
                   AND t.name NOT LIKE 'sys%'
                   AND t.name NOT IN ('_sync_history', 'db_environment')
+                  AND t.name NOT LIKE '%refresh_tokens'
+                  AND t.name NOT LIKE '%password_reset_tokens'
+                  AND t.name NOT LIKE '%email_verification_tokens'
+                  AND t.name NOT LIKE '%verification_tokens'
+                  AND t.name NOT LIKE '%sessions'
                 ORDER BY s.name, t.name";
 
             var tables = await conn.QueryAsync<(string Schema, string Table)>(query, commandTimeout: _commandTimeout);

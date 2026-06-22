@@ -49,6 +49,13 @@ public class ColumnInfo
     /// Whether this column is an identity/auto-increment column
     /// </summary>
     public bool IsIdentity { get; set; }
+
+    /// <summary>
+    /// Whether this column is GENERATED ALWAYS AS ... STORED (computed by the
+    /// database). Generated columns cannot be inserted into, so they are excluded
+    /// from sync — the target recomputes them automatically.
+    /// </summary>
+    public bool IsGenerated { get; set; }
     
     /// <summary>
     /// Position of the column in the table (1-based)

@@ -146,6 +146,9 @@ public class BulkDataCopier
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
+            // Reset sequences to prevent future ID conflicts
+            result.SequenceResetWarnings.AddRange(await ResetSequencesAsync(targetConn, targetTableName));
+
             // Handle synchronized deletes
             if (config.DeleteMode == DeleteMode.Sync)
             {
@@ -260,6 +263,9 @@ public class BulkDataCopier
 
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
+
+            // Reset sequences to prevent future ID conflicts
+            result.SequenceResetWarnings.AddRange(await ResetSequencesAsync(targetConn, targetTableName));
 
             // Handle synchronized deletes (full PK comparison)
             // For incremental sync, only perform deletes if SyncAllDeletes is enabled
@@ -410,6 +416,7 @@ public class BulkDataCopier
 
             return $@"
                 INSERT INTO ""{targetTable}"" ({insertColumnList})
+                OVERRIDING SYSTEM VALUE
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO UPDATE SET {updateSetClause}";
@@ -418,6 +425,7 @@ public class BulkDataCopier
         {
             return $@"
                 INSERT INTO ""{targetTable}"" ({insertColumnList})
+                OVERRIDING SYSTEM VALUE
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO NOTHING";
@@ -576,6 +584,76 @@ public class BulkDataCopier
 
         var deleted = await conn.ExecuteAsync(deleteSql, commandTimeout: _commandTimeout);
         return deleted;
+    }
+
+    /// <summary>
+    /// Reset sequences for all columns that have associated sequences on the TARGET database.
+    /// Queries the target directly using pg_get_serial_sequence() to find all sequence-backed columns.
+    /// </summary>
+    private async Task<List<string>> ResetSequencesAsync(NpgsqlConnection conn, string targetTableName)
+    {
+        var warnings = new List<string>();
+
+        try
+        {
+            // BulkDataCopier targets use unqualified table names (public schema)
+            var schema = "public";
+            var table = targetTableName;
+            var qualifiedName = $"{schema}.{table}";
+
+            // Query target DB for all columns that have associated sequences
+            var sql = @"
+                SELECT c.column_name, pg_get_serial_sequence(@qualifiedName, c.column_name) AS sequence_name
+                FROM information_schema.columns c
+                WHERE c.table_schema = @schema AND c.table_name = @table
+                  AND pg_get_serial_sequence(@qualifiedName, c.column_name) IS NOT NULL";
+
+            var sequences = (await conn.QueryAsync(sql,
+                new { qualifiedName, schema, table },
+                commandTimeout: _commandTimeout)).ToList();
+
+            if (!sequences.Any())
+                return warnings;
+
+            foreach (var seq in sequences)
+            {
+                try
+                {
+                    string columnName = seq.column_name;
+                    string sequenceName = seq.sequence_name;
+
+                    // Get max value from table
+                    var maxValue = await conn.ExecuteScalarAsync<long>(
+                        $"SELECT COALESCE(MAX(\"{columnName}\"), 0) FROM \"{targetTableName}\"",
+                        commandTimeout: _commandTimeout);
+
+                    // Reset sequence: setval with false means next nextval() returns maxValue + 1
+                    await conn.ExecuteAsync(
+                        $"SELECT setval('{sequenceName}', {maxValue + 1}, false)",
+                        commandTimeout: _commandTimeout);
+
+                    _logger.LogInformation(
+                        "Reset sequence {Sequence} to {Value} for {Table}.{Column}",
+                        sequenceName, maxValue + 1, targetTableName, columnName);
+                }
+                catch (Exception ex)
+                {
+                    var warning = $"Sequence reset failed for {targetTableName}.{(string)seq.column_name}: {ex.Message}";
+                    warnings.Add(warning);
+                    _logger.LogWarning(ex,
+                        "Failed to reset sequence for {Table}.{Column}",
+                        targetTableName, (string)seq.column_name);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            var warning = $"Sequence query failed for {targetTableName}: {ex.Message}";
+            warnings.Add(warning);
+            _logger.LogWarning(ex, "Failed to query sequences for {Table}", targetTableName);
+        }
+
+        return warnings;
     }
 
     /// <summary>

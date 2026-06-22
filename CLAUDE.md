@@ -6,7 +6,9 @@
 
 ### System Instructions
 
-If necessary reference /mnt/devshare/ClaudeProjects/dev_docs_common/PostgreSQLConnectionInfo.txt to connect to db
+If necessary reference `../dev_docs_common/PostgreSQLConnectionInfo.txt` (in this `ClaudeProjects/` tree) to connect to db
+
+**On conversation start:** Offer to run a profile completeness audit (see [Profile Completeness Audit](#profile-completeness-audit) below). Tables get added/removed/renamed in prod as apps evolve, so profiles drift over time.
 
 ### Run Locally
 ```bash
@@ -14,6 +16,8 @@ dotnet run
 ```
 
 The dashboard opens automatically at `http://localhost:5123/dashboard`
+
+**LAN access (ubu2):** `http://ubu2.digsol.us:5123/dashboard` — UFW rule allows port 5123 from `10.10.2.0/24`
 
 ### HTTP API Endpoints
 
@@ -86,11 +90,13 @@ sudo systemctl start database-sync
 | Server | Role | SSH | Service Path | Profiles |
 |--------|------|-----|-------------|----------|
 | **win2** (win2.digsol.us) | SQL Server syncs | `ssh claude@win2.digsol.us` | `C:\Services\DatabaseSync` | LMP_Main, LMP_Archive, LMP_Account (profiles 1-6) |
-| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10) |
+| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10); acx all schemas (profile 11) |
 
 **Important**: Only deploy SQL Server profiles to win2 and PostgreSQL profiles to ubu2. Mixing causes errors (e.g., PG profiles on win2 fail trying to create `_sync_history` with restricted permissions).
 
-**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables.
+**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO, 11-ACX) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables. ACX syncs independently (separate database).
+
+**TODO — RMP database sync**: Once the `rmp` database has been copied/migrated to ubu1 (production), a new sync profile (e.g., `12-RMP-prodpgsql-devpgsql`) will need to be created to sync it from prod to dev on ubu2. This is pending the RMP database setup on ubu1.
 
 ### Remote Deployment via SSH (win2)
 
@@ -103,8 +109,8 @@ dotnet publish DatabaseSync.csproj -c Release -r win-x64 --self-contained true -
 # 2. Stop the service
 ssh claude@win2.digsol.us "sc stop DatabaseSync"
 
-# 3. Copy published files to win2
-scp -r /tmp/DatabaseSync-publish/* claude@win2.digsol.us:"C:/Services/DatabaseSync/"
+# 3. Copy published files to win2 (flat files only, excludes profiles/ directory)
+scp /tmp/DatabaseSync-publish/*.* claude@win2.digsol.us:"C:/Services/DatabaseSync/"
 
 # 4. Copy profile configs (SQL Server profiles only, 1-6)
 scp profiles/[1-6]*.json claude@win2.digsol.us:"C:/Services/DatabaseSync/profiles/"
@@ -116,6 +122,8 @@ ssh claude@win2.digsol.us "sc start DatabaseSync"
 ssh claude@win2.digsol.us "sc query DatabaseSync"
 ssh claude@win2.digsol.us "curl -s http://localhost:5123/health"
 ```
+
+**Important**: Step 3 uses `scp *.* ` (flat files only) instead of `scp -r` to prevent the `profiles/` directory (which contains all profiles including PG profiles 7-10) from being copied to win2. Never use `scp -r` for the full publish directory — it will deploy PG profiles to win2, causing the dashboard to show PostgreSQL schemas that belong on ubu2. Note: `rsync` is not available on win2's PATH, so use `scp` for file transfer.
 
 **Logs on win2**: `D:\Logs\DatabaseSync\sync-YYYYMMDD.log`
 
@@ -176,6 +184,96 @@ sudo systemctl restart database-sync  # Restart
 sudo systemctl status database-sync   # Status
 journalctl -u database-sync -f        # Follow live logs
 ```
+
+---
+
+## Profile Completeness Audit
+
+Sync profiles drift over time as application schemas evolve — tables get added, renamed, or dropped in production. Run this audit periodically to keep profiles in sync with reality.
+
+### Process
+
+1. **Read each PG profile file** (`profiles/7-*.json` through `profiles/11-*.json`) to get the list of configured source tables per profile.
+
+2. **Query the production database** for all actual user tables per schema:
+   ```sql
+   -- For emp database (core, emp, nxs, wgo schemas):
+   SELECT table_schema || '.' || table_name
+   FROM information_schema.tables
+   WHERE table_type = 'BASE TABLE'
+     AND table_schema IN ('core', 'emp', 'nxs', 'wgo')
+   ORDER BY table_schema, table_name;
+
+   -- For acx database (all non-system schemas):
+   SELECT table_schema || '.' || table_name
+   FROM information_schema.tables
+   WHERE table_type = 'BASE TABLE'
+     AND table_schema NOT IN ('information_schema', 'pg_catalog')
+   ORDER BY table_schema, table_name;
+   ```
+   Use connection strings from the profile files themselves.
+
+3. **Compare** each profile's table list against the prod query results:
+   - **Missing tables**: Exist in prod but not in the profile (excluding restricted tables: `db_environment`, `_sync_history`, and EF migration tables like `__EFMigrationsHistory`)
+   - **Stale tables**: In the profile but no longer exist in prod (these get skipped with a warning during sync but add noise)
+
+4. **Assign priorities** for new tables using FK dependencies:
+   ```sql
+   -- Query FK relationships for new tables:
+   SELECT
+       ns.nspname || '.' || cl.relname AS child_table,
+       nsr.nspname || '.' || clr.relname AS parent_table
+   FROM pg_constraint c
+   JOIN pg_class cl ON c.conrelid = cl.oid
+   JOIN pg_namespace ns ON cl.relnamespace = ns.oid
+   JOIN pg_class clr ON c.confrelid = clr.oid
+   JOIN pg_namespace nsr ON clr.relnamespace = nsr.oid
+   WHERE c.contype = 'f'
+     AND ns.nspname || '.' || cl.relname IN (/* new tables */)
+   ORDER BY 1, 2;
+   ```
+   - Tables with no FKs or FKs only to Priority 1 tables → same priority as peers
+   - Tables with FKs to higher-priority tables → one level below their parent
+   - Cross-schema FKs (e.g., `wgo.promotions` → `core.users`) are handled by profile execution order, not within-profile priority
+
+5. **Update profiles**: Add missing tables, remove stale entries, deploy to ubu2, and verify table counts via the health API.
+
+### Tables and Data That Cannot or Should Not Sync
+
+**Auto-excluded by DatabaseSync** (filtered regardless of profile config):
+
+| Table/Pattern | Reason |
+|---------------|--------|
+| `db_environment` | Environment-specific settings that must differ per env |
+| `_sync_history` | Managed by the DatabaseSync service itself |
+| `*refresh_tokens` | Session credentials — syncing leaks prod sessions to dev (AIM Rule #132) |
+| `*password_reset_tokens` | Short-lived tokens with prod-domain URLs (AIM Rule #132) |
+| `*email_verification_tokens` | Short-lived tokens with prod-domain URLs (AIM Rule #132) |
+| `*verification_tokens` | Environment-specific verification records (AIM Rule #132) |
+| `*sessions` | Active user session state, environment-specific (AIM Rule #132) |
+
+> **Note:** The token/session exclusion uses suffix matching. Tables like `shared.user_token_budgets` (which tracks API token quotas, not auth tokens) are NOT matched. If a table name ends with a restricted suffix but contains business data, remove it from the suffix list and add a code comment explaining the exception.
+
+**Exclude from profiles manually:**
+
+| Table/Pattern | Reason |
+|---------------|--------|
+| `__EFMigrationsHistory` | EF Core migration tracking — per-environment state |
+| Tables with no primary key (e.g., `hangfire.lock`) | Upsert requires a PK; sync will fail with "No primary key found" |
+| Hangfire runtime tables (`hangfire.server`, `hangfire.lock`) | Transient per-instance state; syncing overwrites dev's active job runtime |
+
+**Data types with special handling** (sync works, but be aware):
+
+| Type | Example | Behavior |
+|------|---------|----------|
+| pgvector `vector` | `media.face.embedding`, `media.image_meta.embedding`, `interests.items.embedding` | PG→PG: source SELECT casts USER-DEFINED columns to `::text` so Npgsql reads them without a plugin; the text form (`[1,2,3]`) round-trips into the target `vector` column via COPY. (The older try/catch `GetFieldValue<string>` fallback only ever "worked" because `interests.items` had all-NULL embeddings — the first non-null vectors, in `media.*`, exposed and drove this fix.) |
+| Custom enums | `core.curators.curator_tier` (curator_tier_enum) | Works — USER-DEFINED `::text` cast (above) covers enums too (label round-trips into the target enum column) |
+| GENERATED ALWAYS AS … STORED | `media.image_meta.search_vector` (stored tsvector) | PG→PG: auto-excluded from insert/update column lists (detected via `is_generated='ALWAYS'`) — cannot be inserted into; the target recomputes them. Distinct from **trigger**-maintained `search_vector` columns (e.g. `media.location`, `media.audio_meta`), which are handled by `DisableTriggersDuringLoad` |
+
+**During audit, also check for:**
+- Materialized views (not base tables — won't appear in table list but could be confused)
+- Partitioned tables (parent partitioned table can't be directly COPYed into)
+- New schemas that might need their own profile
 
 ---
 
@@ -483,9 +581,14 @@ After loading, all profiles (inline and external) are validated together. If a v
 | WIN1252 encoding support | Auto-detect target encoding and sanitize Unicode characters |
 | Restricted table filtering | Automatically skip db_environment and _sync_history tables |
 | PostgreSQL array support | Handle text[], integer[], and other array types in sync |
+| GENERATED ALWAYS AS IDENTITY support | `OVERRIDING SYSTEM VALUE` clause for PG identity columns (backward-compatible with SERIAL) |
+| Unsupported type fallback | PG→PG: source SELECT casts USER-DEFINED columns (pgvector `vector`, enums) to `::text`; text round-trips into the matching target column via COPY |
+| GENERATED ALWAYS column exclusion | PG→PG: STORED generated columns (e.g. a tsvector `search_vector`) are auto-excluded from insert/update (detected via `is_generated='ALWAYS'`); the target recomputes them |
 | Profile generator | Auto-generate complete sync profiles from source database schema |
 | Graceful missing table handling | Skip missing source/target tables with warning instead of failing |
 | Alphabetical profile ordering | Profiles execute in sorted order for cross-schema FK dependencies |
+| Target-side sequence reset | Queries target DB for sequences after sync to prevent duplicate key errors |
+| FK-safe mirror loads (`DisableTriggersDuringLoad`) | PG→PG: run target session with `session_replication_role='replica'` so self-referential/inbound FKs don't block unique-constraint recovery or orphan deletes (PK/UNIQUE still enforced) |
 
 ---
 
@@ -560,6 +663,7 @@ SyncService
 | `StopOnError` | `false` | Stop entire profile if one table fails | Set `true` when tables have dependencies |
 | `UseNoLock` | `true` | Use WITH (NOLOCK) on SQL Server source queries | Set `false` if you need guaranteed consistency (rare) |
 | `SourceBatchSize` | `100000` | Rows to read per batch from source | Decrease to reduce source DB memory pressure; set to 0 to disable batching |
+| `DisableTriggersDuringLoad` | `false` | PG→PG only: run the **target** load session with `session_replication_role = 'replica'`, suppressing FK/RI triggers so the unique-constraint recovery delete and orphan deletes aren't blocked by self-referential or inbound FKs (PK/UNIQUE still enforced) | Set `true` on full prod→dev **mirror** profiles. **Never on a prod target.** Requires the target user to be a superuser or hold `GRANT SET ON PARAMETER session_replication_role` (PG 15+). Enabled on all 5 PG mirror profiles (7-CORE…11-ACX). See [FK self-reference fix](#fix-self-referential-fk-blocks-unique-constraint-recovery) |
 
 ### Table Options
 
@@ -886,7 +990,7 @@ A common scenario: `tbl_Account_User` has PK on `AccountUserID` but also a uniqu
 - Only retries once to prevent infinite loops
 - Logs all actions for audit trail
 
-**FK limitation:** When the constraint recovery deletes conflicting rows from the target, those deletes may fail if child tables have FK references to the conflicting rows. If this happens, truncate the target table (with `CASCADE` if needed) and re-sync from scratch. This typically only occurs on initial sync when target data is stale.
+**FK limitation:** When the constraint recovery deletes conflicting rows from the target, those deletes may fail if child tables have FK references to the conflicting rows (or the table has a self-referential FK). For **PG→PG mirror** profiles this is solved by `DisableTriggersDuringLoad: true` (see [FK self-reference fix](#fix-self-referential-fk-blocks-unique-constraint-recovery) below) — RI triggers are suppressed on the target so the delete succeeds. Without that flag (or for SQL Server targets), truncate the target table (with `CASCADE` if needed) and re-sync from scratch.
 
 **Configuration:**
 The threshold can be adjusted in profile options (default: 300,000):
@@ -899,6 +1003,24 @@ The threshold can be adjusted in profile options (default: 300,000):
 ```
 
 Set to `0` to disable automatic recovery.
+
+### Fix: self-referential FK blocks unique-constraint recovery
+
+**Symptom:** A PG→PG mirror table with a secondary unique constraint AND inbound/self-referential FKs (the canonical case is `core.events`: unique `uq_events_source`, self-FK `events_duplicate_of_event_id_fkey`, plus 26 inbound child FKs) gets stuck — the unique-constraint recovery's `DELETE` is RESTRICTed by the FKs, the whole table transaction aborts, 0 rows sync, and downstream child tables then fail with FK errors (`23503`).
+
+**Fix:** Set `DisableTriggersDuringLoad: true` on the profile (`ProfileOptions`). The target bulk-load session runs under `session_replication_role = 'replica'`, which suppresses FK/RI **triggers** (so deletes/inserts aren't blocked by FK ordering or self-FKs) while still enforcing PK/UNIQUE indexes (so the unique-violation recovery still fires — its delete now just succeeds). Applied at every target-connection open in `PostgreSqlBulkDataCopier`, and on the orphan-delete connection in `PostgreSqlSchemaAnalyzer.DeleteByPrimaryKeysAsync` (target analyzer only — never the source).
+
+**Requirements / guardrails:**
+- The flag is wired through `SyncOrchestrator` for the PG→PG copier only and defaults to `false` — it can never reach a SQL Server target or a target you don't opt in.
+- **Never enable for a production target.** Enabled only on the 5 prod→dev mirror profiles (7-CORE, 8-EMP, 9-NXS, 10-WGO, 11-ACX).
+- `session_replication_role` is superuser-only to set, **unless** the target user is granted the parameter (PG 15+):
+  ```sql
+  -- DEV target only — run once as the claude superuser on devpgsql:
+  GRANT SET ON PARAMETER session_replication_role TO empdev;   -- emp database mirror users
+  GRANT SET ON PARAMETER session_replication_role TO acxdev;   -- acx database mirror user
+  ```
+  (parameter ACLs are cluster-wide in `pg_parameter_acl`, so one grant per role covers all databases). If the grant is missing, the GUC set is skipped with a one-time warning and sync proceeds with triggers on (pre-existing FK-block behavior) — it degrades, it doesn't crash.
+- Full diagnosis and one-time manual reseed runbook: `devdocs/core-events-sync-stuck-fk-recovery.md`.
 
 ---
 
@@ -1089,7 +1211,8 @@ Use numbered prefixes to control execution order:
 7-CORE-prodpgsql-devpgsql    ← Runs first  (core.users, core.events, core.talent, etc.)
 8-EMP-prodpgsql-devpgsql     ← Runs second (emp.user_event_assignments → core.events)
 9-NXS-prodpgsql-devpgsql     ← Runs third  (nxs.songs, nxs.setlists, etc.)
-10-WGO-prodpgsql-devpgsql    ← Runs last   (wgo.event_clicks → core.events)
+10-WGO-prodpgsql-devpgsql    ← Runs fourth (wgo.event_clicks → core.events)
+11-ACX-prodpgsql-devpgsql    ← Runs last   (acx database, all schemas — independent)
 ```
 
 ### Cross-Schema FK Dependencies
@@ -1333,6 +1456,18 @@ The `TypeMapper` class handles type conversion between databases:
 
 **Restricted permissions**: Sync users should have data manipulation privileges only (SELECT, INSERT, UPDATE, DELETE, TRUNCATE) but should NOT have schema modification privileges (CREATE, DROP). Tables should be owned by a separate admin user (e.g., `postgres` or `claude`), not by the sync user.
 
+> **IMPORTANT — Sequence permissions for sync users:** Any database user used as a **target** connection in a sync profile **must** have UPDATE privilege on sequences in every synced schema. Without this, `setval()` calls after sync (which reset IDENTITY sequences to match source data) will silently fail, causing sequence drift and eventual duplicate key errors. Apply these grants on the **target (dev) database only** — source connections are read-only.
+>
+> ```sql
+> -- One-time: grant on all existing sequences
+> GRANT UPDATE ON ALL SEQUENCES IN SCHEMA <schema> TO <sync_user>;
+>
+> -- Permanent: auto-grant on future sequences created by the table owner
+> ALTER DEFAULT PRIVILEGES FOR ROLE claude IN SCHEMA <schema> GRANT UPDATE ON SEQUENCES TO <sync_user>;
+> ```
+>
+> Run both statements for **every schema** the sync user targets. The `ALTER DEFAULT PRIVILEGES` ensures new tables with IDENTITY columns automatically get the correct grants — no manual intervention needed when schemas evolve.
+
 **Pre-creating sync history table**: When using restricted database users without CREATE permission, the `_sync_history` table must be pre-created by an admin user. Run the following SQL with a privileged user (e.g., `postgres` or `claude`):
 
 ```sql
@@ -1420,4 +1555,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Fixed delete type casting for PostgreSQL PKs; added alphabetical profile ordering for cross-schema FK deps; added graceful missing table handling (skip with warning); fixed WGO profile priorities for scrape chain; documented profile execution order and cross-schema dependencies*
+*Last Updated: Added all 12 `media.*` tables to profile 11-ACX (prod→dev mirror) for the ACX media catalog — AIM task #1281 (task listed 8; prod had drifted to 12: +face, +file_action, +person, +thumbnail). Fixed two latent PG→PG bugs the first non-null pgvector data exposed: (1) reading a `vector` threw because the try/catch fallback's `GetFieldValue<string>` is unsupported for `vector` — now the source SELECT casts USER-DEFINED columns to `::text` (covers vector + enums uniformly); (2) `media.image_meta.search_vector` is GENERATED ALWAYS STORED and can't be inserted into — generated columns are now auto-excluded (detected via `is_generated='ALWAYS'`) and recomputed on the target. Verified: 55/55 tables, all 12 media counts match prod, vector values md5-identical, search_vector recomputed on dev. Prior: added `DisableTriggersDuringLoad` (session_replication_role='replica') to unstick `core.events` PG→PG mirror sync where self-referential/inbound FKs blocked unique-constraint recovery and orphan deletes — enabled on all 5 PG mirror profiles, granted the GUC parameter to empdev/acxdev on devpgsql; added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*

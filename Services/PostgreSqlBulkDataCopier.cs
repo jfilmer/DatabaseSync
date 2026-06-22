@@ -46,6 +46,21 @@ public class PostgreSqlBulkDataCopier
     /// </summary>
     public int SourceBatchSize { get; set; } = 100000;
 
+    /// <summary>
+    /// When true, set <c>session_replication_role = 'replica'</c> on the target connection
+    /// after each open, suppressing FK/RI triggers so the unique-constraint recovery
+    /// delete/insert and cross-table ordering aren't blocked by self-referential or inbound FKs.
+    /// PK/UNIQUE indexes remain enforced. For full prod->dev mirror loads only — never a prod target.
+    /// Requires the target user to be a superuser or to hold
+    /// <c>GRANT SET ON PARAMETER session_replication_role</c> (PostgreSQL 15+).
+    /// See devdocs/core-events-sync-stuck-fk-recovery.md.
+    /// </summary>
+    public bool DisableTriggersDuringLoad { get; set; } = false;
+
+    // Tracks whether we've already logged a warning about lacking privilege to set the GUC,
+    // so a non-superuser target user doesn't spam the log once per table.
+    private bool _replicaRoleWarningLogged;
+
     public PostgreSqlBulkDataCopier(
         string sourceConnectionString,
         string targetConnectionString,
@@ -118,9 +133,12 @@ public class PostgreSqlBulkDataCopier
                 $"Table {sourceTableName} has no primary key. Cannot perform upsert.");
         }
 
-        // Include ALL columns for insert (including identity columns to preserve source values)
-        var insertColumns = columns.ToList();
-        var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
+        // Exclude GENERATED ALWAYS columns (e.g. a STORED tsvector search_vector) —
+        // they cannot be inserted into and are recomputed by the target automatically.
+        // Include identity columns to preserve source values.
+        var syncColumns = columns.Where(c => !c.IsGenerated).ToList();
+        var insertColumns = syncColumns.ToList();
+        var updateColumns = syncColumns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
         var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
         if (stagingTableName.Length > 63) stagingTableName = stagingTableName[..63];
@@ -138,6 +156,11 @@ public class PostgreSqlBulkDataCopier
         // Detect target server encoding for character sanitization
         await DetectTargetEncodingAsync(targetConn);
 
+        // Mirror load: optionally suppress FK/RI triggers on the target so the
+        // unique-constraint recovery delete/insert isn't blocked by self-referential
+        // or inbound foreign keys. PK/UNIQUE constraints remain enforced.
+        await SetReplicaRoleIfEnabledAsync(targetConn);
+
         try
         {
             // Create staging table
@@ -145,7 +168,7 @@ public class PostgreSqlBulkDataCopier
             await CreateStagingTableAsync(targetConn, stagingTableName, targetTableName);
 
             // Build source query
-            var sourceColumnList = string.Join(", ", insertColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
+            var sourceColumnList = BuildSourceColumnList(insertColumns);
             var formattedSourceTable = FormatTableNameForSql(sourceTableName);
             var sourceQuery = $"SELECT {sourceColumnList} FROM {formattedSourceTable}";
 
@@ -185,8 +208,8 @@ public class PostgreSqlBulkDataCopier
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
-            // Reset sequences for identity columns to prevent future conflicts
-            await ResetSequencesAsync(targetConn, targetTableName, columns);
+            // Reset sequences to prevent future ID conflicts
+            result.SequenceResetWarnings.AddRange(await ResetSequencesAsync(targetConn, targetTableName));
 
             // Handle synchronized deletes (unless skipDelete is true for two-phase sync)
             if (config.DeleteMode == DeleteMode.Sync && !skipDelete)
@@ -238,6 +261,10 @@ public class PostgreSqlBulkDataCopier
         await SetUtf8EncodingAsync(sourceConn);
         await SetUtf8EncodingAsync(targetConn);
 
+        // Mirror load: optionally suppress FK/RI triggers on the target so deletes in
+        // reverse priority order aren't blocked by self-referential or inbound foreign keys.
+        await SetReplicaRoleIfEnabledAsync(targetConn);
+
         return await SyncDeletesAsync(sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, sourceFilter);
     }
 
@@ -262,9 +289,12 @@ public class PostgreSqlBulkDataCopier
                 $"Table {sourceTableName} has no primary key. Cannot perform upsert.");
         }
 
-        // Include ALL columns for insert (including identity columns to preserve source values)
-        var insertColumns = columns.ToList();
-        var updateColumns = columns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
+        // Exclude GENERATED ALWAYS columns (e.g. a STORED tsvector search_vector) —
+        // they cannot be inserted into and are recomputed by the target automatically.
+        // Include identity columns to preserve source values.
+        var syncColumns = columns.Where(c => !c.IsGenerated).ToList();
+        var insertColumns = syncColumns.ToList();
+        var updateColumns = syncColumns.Where(c => !c.IsPrimaryKey && !c.IsIdentity).ToList();
 
         var stagingTableName = $"_staging_{targetTableName}_{Guid.NewGuid():N}";
         if (stagingTableName.Length > 63) stagingTableName = stagingTableName[..63];
@@ -282,12 +312,17 @@ public class PostgreSqlBulkDataCopier
         // Detect target server encoding for character sanitization
         await DetectTargetEncodingAsync(targetConn);
 
+        // Mirror load: optionally suppress FK/RI triggers on the target so the
+        // unique-constraint recovery delete/insert isn't blocked by self-referential
+        // or inbound foreign keys. PK/UNIQUE constraints remain enforced.
+        await SetReplicaRoleIfEnabledAsync(targetConn);
+
         try
         {
             await CreateStagingTableAsync(targetConn, stagingTableName, targetTableName);
 
             // Build incremental query
-            var sourceColumnList = string.Join(", ", insertColumns.Select(c => $"\"{c.ColumnName.ToLower()}\""));
+            var sourceColumnList = BuildSourceColumnList(insertColumns);
             var timestampCol = config.TimestampColumn!.ToLower();
 
             // Use COALESCE if FallbackTimestampColumn is specified
@@ -340,8 +375,8 @@ public class PostgreSqlBulkDataCopier
             result.RowsInserted = countAfter - countBefore;
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
-            // Reset sequences for identity columns to prevent future conflicts
-            await ResetSequencesAsync(targetConn, targetTableName, columns);
+            // Reset sequences to prevent future ID conflicts
+            result.SequenceResetWarnings.AddRange(await ResetSequencesAsync(targetConn, targetTableName));
 
             // Handle synchronized deletes (full PK comparison)
             // For incremental sync, only perform deletes if SyncAllDeletes is enabled
@@ -392,6 +427,43 @@ public class PostgreSqlBulkDataCopier
         tzCmd.CommandTimeout = _commandTimeout;
         await tzCmd.ExecuteNonQueryAsync();
         _logger.LogDebug("PostgreSQL session timezone set to UTC on {Host}", conn.Host);
+    }
+
+    /// <summary>
+    /// When <see cref="DisableTriggersDuringLoad"/> is enabled, set
+    /// <c>session_replication_role = 'replica'</c> on the (target) connection so FK/RI
+    /// triggers are suppressed for this session. Must be called after every open because
+    /// the setting is per-connection session state and Npgsql resets pooled connections.
+    /// If the connection's user lacks the privilege (not superuser and no parameter grant),
+    /// the GUC set is skipped with a one-time warning and sync proceeds with triggers enabled.
+    /// </summary>
+    private async Task SetReplicaRoleIfEnabledAsync(NpgsqlConnection targetConn)
+    {
+        if (!DisableTriggersDuringLoad)
+            return;
+
+        try
+        {
+            await using var cmd = new NpgsqlCommand("SET session_replication_role = 'replica'", targetConn);
+            cmd.CommandTimeout = _commandTimeout;
+            await cmd.ExecuteNonQueryAsync();
+            _logger.LogDebug(
+                "Set session_replication_role = 'replica' on target {Host} (FK/RI triggers suppressed for this session)",
+                targetConn.Host);
+        }
+        catch (PostgresException ex) when (ex.SqlState == "42501") // insufficient_privilege
+        {
+            if (!_replicaRoleWarningLogged)
+            {
+                _replicaRoleWarningLogged = true;
+                _logger.LogWarning(
+                    "DisableTriggersDuringLoad is enabled but target user lacks privilege to set " +
+                    "session_replication_role. FK/RI triggers will remain ON and unique-constraint " +
+                    "recovery deletes may be blocked by foreign keys. Grant it on the DEV target only: " +
+                    "GRANT SET ON PARAMETER session_replication_role TO <target_user>; (PostgreSQL 15+), " +
+                    "or point the profile at a superuser role. See devdocs/core-events-sync-stuck-fk-recovery.md");
+            }
+        }
     }
 
     /// <summary>
@@ -446,6 +518,25 @@ public class PostgreSqlBulkDataCopier
         return result.ToString();
     }
 
+    /// <summary>
+    /// Builds the SELECT column list for the source query. USER-DEFINED columns
+    /// (pgvector 'vector', enums, etc.) are cast to ::text so Npgsql can read them
+    /// without a type plugin — the text form (e.g. vector '[1,2,3]', enum label)
+    /// round-trips back into the matching target column via COPY's implicit cast.
+    /// Without this, reading a non-null 'vector' throws
+    /// "Reading as 'System.String' is not supported for fields having DataTypeName 'public.vector'".
+    /// </summary>
+    private static string BuildSourceColumnList(List<ColumnInfo> columns)
+    {
+        return string.Join(", ", columns.Select(c =>
+        {
+            var name = c.ColumnName.ToLower();
+            return c.DataType.Equals("USER-DEFINED", StringComparison.OrdinalIgnoreCase)
+                ? $"\"{name}\"::text AS \"{name}\""
+                : $"\"{name}\"";
+        }));
+    }
+
     private async Task CreateStagingTableAsync(NpgsqlConnection conn, string stagingTableName, string targetTableName)
     {
         var formattedTargetTable = FormatTableNameForSql(targetTableName);
@@ -480,7 +571,28 @@ public class PostgreSqlBulkDataCopier
 
             for (int i = 0; i < columns.Count; i++)
             {
-                var value = reader.GetValue(i);
+                object value;
+                try
+                {
+                    value = reader.GetValue(i);
+                }
+                catch (Exception)
+                {
+                    // Unsupported types (e.g. pgvector 'vector') - read as text representation
+                    if (reader.IsDBNull(i))
+                    {
+                        values[i] = "\\N";
+                        continue;
+                    }
+                    var strValue = reader.GetFieldValue<string>(i);
+                    strValue = SanitizeForTargetEncoding(strValue);
+                    strValue = strValue.Replace("\\", "\\\\")
+                                      .Replace("\t", "\\t")
+                                      .Replace("\n", "\\n")
+                                      .Replace("\r", "\\r");
+                    values[i] = strValue;
+                    continue;
+                }
 
                 if (value == DBNull.Value || value == null)
                 {
@@ -620,6 +732,7 @@ public class PostgreSqlBulkDataCopier
 
             return $@"
                 INSERT INTO {formattedTargetTable} ({insertColumnList})
+                OVERRIDING SYSTEM VALUE
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO UPDATE SET {updateSetClause}";
@@ -628,6 +741,7 @@ public class PostgreSqlBulkDataCopier
         {
             return $@"
                 INSERT INTO {formattedTargetTable} ({insertColumnList})
+                OVERRIDING SYSTEM VALUE
                 SELECT {insertColumnList} FROM ""{stagingTable}""
                 ON CONFLICT ({pkColumnList})
                 DO NOTHING";
@@ -806,53 +920,72 @@ public class PostgreSqlBulkDataCopier
     }
 
     /// <summary>
-    /// Reset sequences for identity columns to prevent future ID conflicts
+    /// Reset sequences for all columns that have associated sequences on the TARGET database.
+    /// Queries the target directly using pg_get_serial_sequence() instead of relying on
+    /// source IsIdentity flags, which may not detect all sequence-backed columns.
     /// </summary>
-    private async Task ResetSequencesAsync(
-        NpgsqlConnection conn,
-        string tableName,
-        List<ColumnInfo> columns)
+    private async Task<List<string>> ResetSequencesAsync(NpgsqlConnection conn, string tableName)
     {
+        var warnings = new List<string>();
         var (schema, table) = ParseTableName(tableName);
-        var identityColumns = columns.Where(c => c.IsIdentity).ToList();
+        var qualifiedName = $"{schema}.{table}";
+        var formattedTableName = FormatTableNameForSql(tableName);
 
-        if (!identityColumns.Any())
-            return;
-
-        foreach (var column in identityColumns)
+        try
         {
-            try
+            // Query target DB for all columns that have associated sequences
+            var sql = @"
+                SELECT c.column_name, pg_get_serial_sequence(@qualifiedName, c.column_name) AS sequence_name
+                FROM information_schema.columns c
+                WHERE c.table_schema = @schema AND c.table_name = @table
+                  AND pg_get_serial_sequence(@qualifiedName, c.column_name) IS NOT NULL";
+
+            var sequences = (await conn.QueryAsync(sql,
+                new { qualifiedName, schema, table },
+                commandTimeout: _commandTimeout)).ToList();
+
+            if (!sequences.Any())
+                return warnings;
+
+            foreach (var seq in sequences)
             {
-                // Query pg_get_serial_sequence to get the actual sequence name
-                var sequenceName = await conn.ExecuteScalarAsync<string>(
-                    "SELECT pg_get_serial_sequence(@tableName, @columnName)",
-                    new { tableName = $"{schema}.{table}", columnName = column.ColumnName.ToLower() },
-                    commandTimeout: _commandTimeout);
-
-                if (!string.IsNullOrEmpty(sequenceName))
+                try
                 {
+                    string columnName = seq.column_name;
+                    string sequenceName = seq.sequence_name;
+
                     // Get max value from table
-                    var formattedTableName = FormatTableNameForSql(tableName);
-                    var maxValueSql = $"SELECT COALESCE(MAX(\"{column.ColumnName.ToLower()}\"), 0) FROM {formattedTableName}";
-                    var maxValue = await conn.ExecuteScalarAsync<long>(maxValueSql, commandTimeout: _commandTimeout);
+                    var maxValue = await conn.ExecuteScalarAsync<long>(
+                        $"SELECT COALESCE(MAX(\"{columnName}\"), 0) FROM {formattedTableName}",
+                        commandTimeout: _commandTimeout);
 
-                    // Reset sequence to max + 1
-                    var resetSql = $"SELECT setval('{sequenceName}', {maxValue + 1}, false)";
-                    await conn.ExecuteAsync(resetSql, commandTimeout: _commandTimeout);
+                    // Reset sequence: setval with false means next nextval() returns maxValue + 1
+                    await conn.ExecuteAsync(
+                        $"SELECT setval('{sequenceName}', {maxValue + 1}, false)",
+                        commandTimeout: _commandTimeout);
 
-                    _logger.LogDebug(
-                        "Reset sequence {Sequence} for column {Column} to {Value}",
-                        sequenceName, column.ColumnName, maxValue + 1);
+                    _logger.LogInformation(
+                        "Reset sequence {Sequence} to {Value} for {Table}.{Column}",
+                        sequenceName, maxValue + 1, tableName, columnName);
+                }
+                catch (Exception ex)
+                {
+                    var warning = $"Sequence reset failed for {tableName}.{(string)seq.column_name}: {ex.Message}";
+                    warnings.Add(warning);
+                    _logger.LogWarning(ex,
+                        "Failed to reset sequence for {Table}.{Column}",
+                        tableName, (string)seq.column_name);
                 }
             }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex,
-                    "Failed to reset sequence for {Table}.{Column}",
-                    tableName, column.ColumnName);
-                // Don't fail the entire sync if sequence reset fails
-            }
         }
+        catch (Exception ex)
+        {
+            var warning = $"Sequence query failed for {tableName}: {ex.Message}";
+            warnings.Add(warning);
+            _logger.LogWarning(ex, "Failed to query sequences for {Table}", tableName);
+        }
+
+        return warnings;
     }
 
     /// <summary>
@@ -924,7 +1057,12 @@ public class PostgreSqlBulkDataCopier
         var targetAnalyzer = new PostgreSqlSchemaAnalyzer(
             _targetConnectionString,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<PostgreSqlSchemaAnalyzer>.Instance,
-            _commandTimeout);
+            _commandTimeout)
+        {
+            // Suppress FK/RI triggers on the TARGET only (never the source) so orphan deletes
+            // aren't blocked by inbound/self-referential foreign keys during a mirror load.
+            DisableTriggersDuringLoad = DisableTriggersDuringLoad
+        };
 
         var targetPks = await targetAnalyzer.GetPrimaryKeyValuesAsync(targetTableName, pkColumns, null);
         _logger.LogDebug("Found {Count:N0} rows in target", targetPks.Count);

@@ -61,6 +61,11 @@ public class SyncResult
     /// Non-fatal warnings encountered during sync
     /// </summary>
     public List<string> Warnings { get; set; } = new();
+
+    /// <summary>
+    /// Whether sequence reset failed for this table (setval permission or other error)
+    /// </summary>
+    public bool SequenceResetFailed { get; set; }
     
     /// <summary>
     /// Calculated rows per second throughput
@@ -167,4 +172,9 @@ public class BulkCopyResult
     /// Number of rows that were recently modified (within last 168 hours based on timestamp column)
     /// </summary>
     public long RecentRowsCount { get; set; }
+
+    /// <summary>
+    /// Warnings from sequence reset operations (setval failures)
+    /// </summary>
+    public List<string> SequenceResetWarnings { get; set; } = new();
 }
