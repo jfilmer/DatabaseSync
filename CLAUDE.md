@@ -90,13 +90,13 @@ sudo systemctl start database-sync
 | Server | Role | SSH | Service Path | Profiles |
 |--------|------|-----|-------------|----------|
 | **win2** (win2.digsol.us) | SQL Server syncs | `ssh claude@win2.digsol.us` | `C:\Services\DatabaseSync` | LMP_Main, LMP_Archive, LMP_Account (profiles 1-6) |
-| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10); acx all schemas (profile 11) |
+| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10); acx all schemas (profile 11); rmp `rmp` schema (profile 12) |
 
 **Important**: Only deploy SQL Server profiles to win2 and PostgreSQL profiles to ubu2. Mixing causes errors (e.g., PG profiles on win2 fail trying to create `_sync_history` with restricted permissions).
 
-**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO, 11-ACX) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables. ACX syncs independently (separate database).
+**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO, 11-ACX, 12-RMP) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables. ACX and RMP each sync independently (separate databases).
 
-**TODO — RMP database sync**: Once the `rmp` database has been copied/migrated to ubu1 (production), a new sync profile (e.g., `12-RMP-prodpgsql-devpgsql`) will need to be created to sync it from prod to dev on ubu2. This is pending the RMP database setup on ubu1.
+**RMP database sync** (profile `12-RMP-prodpgsql-devpgsql`, done 2026-06-22): mirrors the `rmp` schema of the `rmp` database prod→dev (39 tables; FullRefresh + DeleteMode Sync + `DisableTriggersDuringLoad`, daily 05:00). Excluded: `public.spatial_ref_sys` (PostGIS system table), `schemaversions` (DbUp migration tracking — per-environment), and `refresh_tokens`/`password_reset_tokens` (auto-skipped by Rule #132). PostGIS `geography` columns (`communities.geo_boundary`, `listings.geo_point`) sync via the USER-DEFINED `::text` cast (verified md5-identical); generated `listings.description_tsv` is auto-excluded and recomputed on the target. **One-time dev-side setup performed** (target `rmpdev` is a restricted user): `GRANT SET ON PARAMETER session_replication_role TO rmpdev`; `GRANT UPDATE ON ALL SEQUENCES IN SCHEMA rmp TO rmpdev` + matching `ALTER DEFAULT PRIVILEGES FOR ROLE claude`; and `_sync_history` pre-created in the **public** schema (NOT `rmp`) — the rmp database's `search_path = "rmp, public"` means an unqualified create lands in `rmp`, but `PostgreSqlSyncHistoryRepository.InitializeAsync` only existence-checks `public`, so it must live in `public` or the service tries (and fails) to CREATE it as the restricted user.
 
 ### Remote Deployment via SSH (win2)
 
@@ -193,7 +193,7 @@ Sync profiles drift over time as application schemas evolve — tables get added
 
 ### Process
 
-1. **Read each PG profile file** (`profiles/7-*.json` through `profiles/11-*.json`) to get the list of configured source tables per profile.
+1. **Read each PG profile file** (`profiles/7-*.json` through `profiles/12-*.json`) to get the list of configured source tables per profile.
 
 2. **Query the production database** for all actual user tables per schema:
    ```sql
@@ -1018,6 +1018,7 @@ Set to `0` to disable automatic recovery.
   -- DEV target only — run once as the claude superuser on devpgsql:
   GRANT SET ON PARAMETER session_replication_role TO empdev;   -- emp database mirror users
   GRANT SET ON PARAMETER session_replication_role TO acxdev;   -- acx database mirror user
+  GRANT SET ON PARAMETER session_replication_role TO rmpdev;   -- rmp database mirror user
   ```
   (parameter ACLs are cluster-wide in `pg_parameter_acl`, so one grant per role covers all databases). If the grant is missing, the GUC set is skipped with a one-time warning and sync proceeds with triggers on (pre-existing FK-block behavior) — it degrades, it doesn't crash.
 - Full diagnosis and one-time manual reseed runbook: `devdocs/core-events-sync-stuck-fk-recovery.md`.
@@ -1212,7 +1213,8 @@ Use numbered prefixes to control execution order:
 8-EMP-prodpgsql-devpgsql     ← Runs second (emp.user_event_assignments → core.events)
 9-NXS-prodpgsql-devpgsql     ← Runs third  (nxs.songs, nxs.setlists, etc.)
 10-WGO-prodpgsql-devpgsql    ← Runs fourth (wgo.event_clicks → core.events)
-11-ACX-prodpgsql-devpgsql    ← Runs last   (acx database, all schemas — independent)
+11-ACX-prodpgsql-devpgsql    ← Runs next   (acx database, all schemas — independent)
+12-RMP-prodpgsql-devpgsql    ← Runs last   (rmp database, rmp schema — independent)
 ```
 
 ### Cross-Schema FK Dependencies
@@ -1555,4 +1557,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated: Added all 12 `media.*` tables to profile 11-ACX (prod→dev mirror) for the ACX media catalog — AIM task #1281 (task listed 8; prod had drifted to 12: +face, +file_action, +person, +thumbnail). Fixed two latent PG→PG bugs the first non-null pgvector data exposed: (1) reading a `vector` threw because the try/catch fallback's `GetFieldValue<string>` is unsupported for `vector` — now the source SELECT casts USER-DEFINED columns to `::text` (covers vector + enums uniformly); (2) `media.image_meta.search_vector` is GENERATED ALWAYS STORED and can't be inserted into — generated columns are now auto-excluded (detected via `is_generated='ALWAYS'`) and recomputed on the target. Verified: 55/55 tables, all 12 media counts match prod, vector values md5-identical, search_vector recomputed on dev. Prior: added `DisableTriggersDuringLoad` (session_replication_role='replica') to unstick `core.events` PG→PG mirror sync where self-referential/inbound FKs blocked unique-constraint recovery and orphan deletes — enabled on all 5 PG mirror profiles, granted the GUC parameter to empdev/acxdev on devpgsql; added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*
+*Last Updated: Added profile 12-RMP-prodpgsql-devpgsql (rmp database, rmp schema, 39 tables, prod→dev mirror, daily 05:00, DisableTriggersDuringLoad) — RMP is now on ubu1 so the long-standing TODO is done. First PostGIS sync: `geography` columns round-trip via the USER-DEFINED `::text` cast (md5-identical), generated `listings.description_tsv` auto-excluded/recomputed. Excluded spatial_ref_sys, schemaversions, and token tables. Dev-side one-time setup: granted rmpdev the session_replication_role param + sequence UPDATEs, and pre-created `_sync_history` in **public** (the rmp DB's search_path puts rmp first, but the repo only existence-checks public). Verified 39/39 tables, counts match prod. Also cleaned 4 stray non-profile files (appsettings*.json, *.deps.json, *.runtimeconfig.json) out of ubu2's profiles/ dir that were being misparsed as a phantom 'Default' profile. Prior: Added all 12 `media.*` tables to profile 11-ACX (prod→dev mirror) for the ACX media catalog — AIM task #1281 (task listed 8; prod had drifted to 12: +face, +file_action, +person, +thumbnail). Fixed two latent PG→PG bugs the first non-null pgvector data exposed: (1) reading a `vector` threw because the try/catch fallback's `GetFieldValue<string>` is unsupported for `vector` — now the source SELECT casts USER-DEFINED columns to `::text` (covers vector + enums uniformly); (2) `media.image_meta.search_vector` is GENERATED ALWAYS STORED and can't be inserted into — generated columns are now auto-excluded (detected via `is_generated='ALWAYS'`) and recomputed on the target. Verified: 55/55 tables, all 12 media counts match prod, vector values md5-identical, search_vector recomputed on dev. Prior: added `DisableTriggersDuringLoad` (session_replication_role='replica') to unstick `core.events` PG→PG mirror sync where self-referential/inbound FKs blocked unique-constraint recovery and orphan deletes — enabled on all 5 PG mirror profiles, granted the GUC parameter to empdev/acxdev on devpgsql; added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*
