@@ -709,6 +709,25 @@ public class ProfileOptions
     /// Default: 100000 (100K rows per batch)
     /// </summary>
     public int SourceBatchSize { get; set; } = 100000;
+
+    /// <summary>
+    /// PostgreSQL-to-PostgreSQL only: run the target bulk-load session with
+    /// <c>session_replication_role = 'replica'</c>, which suppresses foreign-key/RI
+    /// triggers on the target for the duration of each connection. This lets the
+    /// unique-constraint recovery path delete-and-reinsert conflicting rows without
+    /// being blocked by self-referential FKs (e.g. core.events.events_duplicate_of_event_id_fkey)
+    /// or the table's inbound child FKs. PK/UNIQUE indexes are still enforced.
+    ///
+    /// Intended for full prod->dev mirror profiles only. Requires the target connection
+    /// user to be able to SET this GUC: either a superuser, or (PostgreSQL 15+) a role
+    /// granted the parameter via <c>GRANT SET ON PARAMETER session_replication_role TO &lt;user&gt;</c>.
+    /// If the target user lacks the privilege the GUC set is skipped with a warning and
+    /// sync proceeds with triggers enabled (pre-existing behavior).
+    ///
+    /// NEVER enable this for a production target. Default: false.
+    /// See devdocs/core-events-sync-stuck-fk-recovery.md.
+    /// </summary>
+    public bool DisableTriggersDuringLoad { get; set; } = false;
 }
 
 /// <summary>

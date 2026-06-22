@@ -39,11 +39,22 @@ public class SyncOrchestrator
     // Optional callback for progress updates (tableName, rowsProcessed, phase)
     private readonly Action<string, long, string>? _progressCallback;
 
-    // Tables that should never be synced (system tables)
+    // Tables that should never be synced (exact name match, case-insensitive)
     private static readonly HashSet<string> RestrictedTableNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "db_environment",
         "_sync_history"
+    };
+
+    // Tables that should never be synced (suffix match, case-insensitive)
+    // Auth tokens and sessions are environment-specific and a security concern (AIM Rule #132)
+    private static readonly string[] RestrictedTableSuffixes = new[]
+    {
+        "refresh_tokens",
+        "password_reset_tokens",
+        "email_verification_tokens",
+        "verification_tokens",
+        "sessions"
     };
 
     public SyncOrchestrator(
@@ -159,7 +170,8 @@ public class SyncOrchestrator
                     pgToPgCopierLogger,
                     profile.Options.CommandTimeoutSeconds)
                 {
-                    SourceBatchSize = profile.Options.SourceBatchSize
+                    SourceBatchSize = profile.Options.SourceBatchSize,
+                    DisableTriggersDuringLoad = profile.Options.DisableTriggersDuringLoad
                 };
                 break;
 
@@ -391,6 +403,13 @@ public class SyncOrchestrator
             result.RecentRowsCount = copyResult.RecentRowsCount;
             result.Success = true;
 
+            // Surface sequence reset failures as warnings
+            if (copyResult.SequenceResetWarnings.Count > 0)
+            {
+                result.SequenceResetFailed = true;
+                result.Warnings.AddRange(copyResult.SequenceResetWarnings);
+            }
+
             // Report final progress
             _progressCallback?.Invoke(tableConfig.SourceTable, copyResult.RowsProcessed, "Complete");
         }
@@ -455,7 +474,9 @@ public class SyncOrchestrator
                 RowsInserted = result.RowsInserted,
                 RowsUpdated = result.RowsUpdated,
                 RowsDeleted = result.RowsDeleted,
-                ErrorMessage = result.Error,
+                ErrorMessage = result.SequenceResetFailed
+                    ? $"{result.Error}{(result.Error != null ? "; " : "")}[SEQ_RESET_FAILED] {string.Join("; ", result.Warnings.Where(w => w.StartsWith("Sequence ")))}"
+                    : result.Error,
                 MaxSourceTimestamp = maxSourceTimestamp,
                 DurationSeconds = result.Duration.TotalSeconds,
                 RecentRowsCount = recentRowsCount,
@@ -499,17 +520,18 @@ public class SyncOrchestrator
             _logger.LogInformation("Using two-phase sync (upserts first, then deletes in reverse priority order)");
         }
 
-        // Filter out restricted tables (db_environment, _sync_history) and group by priority
+        // Filter out restricted tables and group by priority
         var filteredTables = _profile.Tables
             .Where(t => !IsRestrictedTable(t))
             .ToList();
 
-        var skippedTables = _profile.Tables.Count - filteredTables.Count;
-        if (skippedTables > 0)
+        var skippedTables = _profile.Tables.Except(filteredTables).ToList();
+        if (skippedTables.Count > 0)
         {
+            var skippedNames = string.Join(", ", skippedTables.Select(t => t.SourceTable));
             _logger.LogWarning(
-                "Skipped {Count} restricted tables (db_environment, _sync_history)",
-                skippedTables);
+                "Skipped {Count} restricted tables ({Tables})",
+                skippedTables.Count, skippedNames);
         }
 
         var tablesByPriority = filteredTables
@@ -973,7 +995,7 @@ CREATE TABLE [{tableName}] (
     }
 
     /// <summary>
-    /// Check if a table should be skipped (restricted system tables)
+    /// Check if a table should be skipped (restricted system tables or token/session tables)
     /// </summary>
     private static bool IsRestrictedTable(TableConfig table)
     {
@@ -985,8 +1007,20 @@ CREATE TABLE [{tableName}] (
             ? table.TargetTable.Split('.').Last()
             : table.TargetTable;
 
-        return RestrictedTableNames.Contains(sourceTableName) ||
-               RestrictedTableNames.Contains(targetTableName);
+        // Exact name match (system tables)
+        if (RestrictedTableNames.Contains(sourceTableName) ||
+            RestrictedTableNames.Contains(targetTableName))
+            return true;
+
+        // Suffix match (token/session tables — AIM Rule #132)
+        foreach (var suffix in RestrictedTableSuffixes)
+        {
+            if (sourceTableName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) ||
+                targetTableName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 
     /// <summary>

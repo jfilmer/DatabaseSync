@@ -15,6 +15,16 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
     private readonly ILogger<PostgreSqlSchemaAnalyzer> _logger;
     private readonly int _commandTimeout;
 
+    /// <summary>
+    /// When true, set <c>session_replication_role = 'replica'</c> on the connection used for
+    /// orphan-delete sync, so deletes aren't blocked by inbound/self-referential foreign keys.
+    /// Set this ONLY for the target analyzer of a prod->dev mirror — never for a source (prod)
+    /// connection. Requires the user to be a superuser or hold
+    /// <c>GRANT SET ON PARAMETER session_replication_role</c> (PostgreSQL 15+).
+    /// See devdocs/core-events-sync-stuck-fk-recovery.md.
+    /// </summary>
+    public bool DisableTriggersDuringLoad { get; set; } = false;
+
     public PostgreSqlSchemaAnalyzer(
         string connectionString,
         ILogger<PostgreSqlSchemaAnalyzer> logger,
@@ -81,7 +91,8 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
                 c.numeric_scale AS Scale,
                 c.ordinal_position AS OrdinalPosition,
                 COALESCE(pk.is_pk, FALSE) AS IsPrimaryKey,
-                COALESCE(c.column_default LIKE 'nextval%', FALSE) AS IsIdentity
+                COALESCE(c.column_default LIKE 'nextval%', FALSE) AS IsIdentity,
+                (c.is_generated = 'ALWAYS') AS IsGenerated
             FROM information_schema.columns c
             LEFT JOIN (
                 SELECT kcu.column_name, TRUE AS is_pk
@@ -230,6 +241,10 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         await using var connection = new NpgsqlConnection(_connectionString);
         await connection.OpenAsync();
 
+        // Mirror load: optionally suppress FK/RI triggers so orphan deletes aren't blocked
+        // by inbound/self-referential foreign keys. Target connection only. PK/UNIQUE still enforced.
+        await SetReplicaRoleIfEnabledAsync(connection);
+
         if (pkColumns.Count == 1)
         {
             var pkColumn = pkColumns[0];
@@ -300,6 +315,32 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
             }
 
             return totalDeleted;
+        }
+    }
+
+    /// <summary>
+    /// When <see cref="DisableTriggersDuringLoad"/> is enabled, set
+    /// <c>session_replication_role = 'replica'</c> on the connection so FK/RI triggers are
+    /// suppressed for this session. If the user lacks the privilege, the set is skipped with
+    /// a warning and the delete proceeds with triggers enabled (pre-existing behavior).
+    /// </summary>
+    private async Task SetReplicaRoleIfEnabledAsync(NpgsqlConnection connection)
+    {
+        if (!DisableTriggersDuringLoad)
+            return;
+
+        try
+        {
+            await connection.ExecuteAsync("SET session_replication_role = 'replica'",
+                commandTimeout: _commandTimeout);
+        }
+        catch (PostgresException ex) when (ex.SqlState == "42501") // insufficient_privilege
+        {
+            _logger.LogWarning(
+                "DisableTriggersDuringLoad is enabled but target user lacks privilege to set " +
+                "session_replication_role; orphan-delete sync may be blocked by foreign keys. " +
+                "Grant on the DEV target only: GRANT SET ON PARAMETER session_replication_role TO <target_user>; " +
+                "(PostgreSQL 15+). See devdocs/core-events-sync-stuck-fk-recovery.md");
         }
     }
 

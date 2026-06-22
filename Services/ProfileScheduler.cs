@@ -527,7 +527,7 @@ public class ProfileScheduler : BackgroundService
         var profile = _config.Profiles.FirstOrDefault(p =>
             p.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase));
 
-        if (profile == null)
+        if (profile == null || string.IsNullOrEmpty(profile.TargetConnection?.ConnectionString))
         {
             return new List<SyncHistory>();
         }

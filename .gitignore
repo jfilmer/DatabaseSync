@@ -42,6 +42,7 @@ Thumbs.db
 *.Production.json
 *.Local.json
 appsettings*.json
+.mcp.json
 
 # Profile configurations (contain connection strings)
 profiles/

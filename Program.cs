@@ -1028,6 +1028,7 @@ static string GenerateProfileDashboardHtml(
         .number {{ text-align: right; font-family: monospace; }}
         .timestamp {{ color: #888; font-size: 0.85em; }}
         .error-msg {{ color: #dc3545; font-size: 0.85em; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .seq-badge {{ background: #5a4a00; color: #ffc107; border: 1px solid #ffc107; padding: 1px 5px; border-radius: 3px; font-size: 0.75em; font-weight: bold; margin-left: 4px; cursor: help; }}
         .sync-btn {{ background: #0f3460; color: #00d9ff; border: 1px solid #00d9ff; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 0.85em; }}
         .sync-btn:hover {{ background: #00d9ff; color: #0f3460; }}
         .sync-btn:disabled {{ background: #333; color: #666; border-color: #666; cursor: not-allowed; }}
@@ -1236,6 +1237,12 @@ static string GenerateProfileDashboardHtml(
             ? (effectiveRecentRows * 100.0 / mostRecentWithData.RowsUpdated) : 0;
         var recentPercentStr = mostRecentWithData?.RowsUpdated > 0 ? $"{recentPercent:F1}%" : "-";
 
+        var seqFailed = lastSync?.ErrorMessage?.Contains("[SEQ_RESET_FAILED]") == true;
+        var seqBadge = seqFailed ? @"<span class=""seq-badge"" title=""Sequence reset failed — setval() permission denied or error"">Seq</span>" : "";
+        var statusDisplay = lastSync?.Success == true
+            ? (seqFailed ? $"OK {seqBadge}" : "OK")
+            : "FAIL";
+
         sb.Append($@"
                 <tr>
                     <td>{System.Web.HttpUtility.HtmlEncode(table.Key)}</td>
@@ -1246,7 +1253,7 @@ static string GenerateProfileDashboardHtml(
                     <td class=""number"">{tableHistory.Sum(h => h.RowsDeleted):N0}</td>
                     <td class=""number"">{recentPercentStr}</td>
                     <td class=""timestamp"">{lastSync?.SyncEndTime.ToLocalTime():MM-dd HH:mm}</td>
-                    <td class=""{statusClass}"">{(lastSync?.Success == true ? "OK" : "FAIL")}</td>
+                    <td class=""{statusClass}"">{statusDisplay}</td>
                     <td><button class=""sync-btn"" onclick=""triggerSync('{Uri.EscapeDataString(profile.ProfileName)}', '{Uri.EscapeDataString(table.Key)}')"">Sync</button></td>
                 </tr>");
     }
@@ -1278,6 +1285,9 @@ static string GenerateProfileDashboardHtml(
     foreach (var h in history.Take(50))
     {
         var rowClass = h.Success ? "success" : "failed";
+        var histSeqFailed = h.ErrorMessage?.Contains("[SEQ_RESET_FAILED]") == true;
+        var histSeqBadge = histSeqFailed ? @"<span class=""seq-badge"" title=""Sequence reset failed"">Seq</span>" : "";
+        var histStatusDisplay = h.Success ? $"OK{(histSeqFailed ? $" {histSeqBadge}" : "")}" : "FAIL";
         // Calculate Recent % based on RowsUpdated (not RowsProcessed which includes inserts)
         // This answers: "Of the updates we performed, what % were for recent records?"
         var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsUpdated);
@@ -1287,7 +1297,7 @@ static string GenerateProfileDashboardHtml(
                 <tr>
                     <td class=""timestamp"">{h.SyncEndTime.ToLocalTime():MM-dd HH:mm:ss}</td>
                     <td>{System.Web.HttpUtility.HtmlEncode(h.SourceTable)}</td>
-                    <td class=""{rowClass}"">{(h.Success ? "OK" : "FAIL")}</td>
+                    <td class=""{rowClass}"">{histStatusDisplay}</td>
                     <td class=""number"">{h.RowsProcessed:N0}</td>
                     <td class=""number"">{h.RowsInserted:N0}</td>
                     <td class=""number"">{h.RowsUpdated:N0}</td>

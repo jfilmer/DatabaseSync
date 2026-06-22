@@ -147,7 +147,7 @@ public class BulkDataCopier
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
             // Reset sequences to prevent future ID conflicts
-            await ResetSequencesAsync(targetConn, targetTableName);
+            result.SequenceResetWarnings.AddRange(await ResetSequencesAsync(targetConn, targetTableName));
 
             // Handle synchronized deletes
             if (config.DeleteMode == DeleteMode.Sync)
@@ -265,7 +265,7 @@ public class BulkDataCopier
             result.RowsUpdated = result.RowsProcessed - result.RowsInserted;
 
             // Reset sequences to prevent future ID conflicts
-            await ResetSequencesAsync(targetConn, targetTableName);
+            result.SequenceResetWarnings.AddRange(await ResetSequencesAsync(targetConn, targetTableName));
 
             // Handle synchronized deletes (full PK comparison)
             // For incremental sync, only perform deletes if SyncAllDeletes is enabled
@@ -590,8 +590,10 @@ public class BulkDataCopier
     /// Reset sequences for all columns that have associated sequences on the TARGET database.
     /// Queries the target directly using pg_get_serial_sequence() to find all sequence-backed columns.
     /// </summary>
-    private async Task ResetSequencesAsync(NpgsqlConnection conn, string targetTableName)
+    private async Task<List<string>> ResetSequencesAsync(NpgsqlConnection conn, string targetTableName)
     {
+        var warnings = new List<string>();
+
         try
         {
             // BulkDataCopier targets use unqualified table names (public schema)
@@ -611,7 +613,7 @@ public class BulkDataCopier
                 commandTimeout: _commandTimeout)).ToList();
 
             if (!sequences.Any())
-                return;
+                return warnings;
 
             foreach (var seq in sequences)
             {
@@ -636,6 +638,8 @@ public class BulkDataCopier
                 }
                 catch (Exception ex)
                 {
+                    var warning = $"Sequence reset failed for {targetTableName}.{(string)seq.column_name}: {ex.Message}";
+                    warnings.Add(warning);
                     _logger.LogWarning(ex,
                         "Failed to reset sequence for {Table}.{Column}",
                         targetTableName, (string)seq.column_name);
@@ -644,9 +648,12 @@ public class BulkDataCopier
         }
         catch (Exception ex)
         {
+            var warning = $"Sequence query failed for {targetTableName}: {ex.Message}";
+            warnings.Add(warning);
             _logger.LogWarning(ex, "Failed to query sequences for {Table}", targetTableName);
-            // Don't fail the entire sync if sequence reset fails
         }
+
+        return warnings;
     }
 
     /// <summary>
