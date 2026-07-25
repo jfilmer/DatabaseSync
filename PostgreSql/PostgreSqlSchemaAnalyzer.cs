@@ -319,6 +319,130 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
     }
 
     /// <summary>
+    /// Audit referential integrity on this (target) database for a set of parent tables:
+    /// for every inbound foreign key of each parent, count child rows whose parent row no
+    /// longer exists. Read-only — never modifies data.
+    ///
+    /// This exists because a mirror load with <see cref="DisableTriggersDuringLoad"/> suppresses
+    /// the RI triggers that would have RESTRICTed an orphaning delete, so orphans are created
+    /// silently. It is the detection that replaces the FK blocking the flag removes.
+    ///
+    /// NULL foreign key values are not orphans (MATCH SIMPLE semantics: a row with any NULL in
+    /// the FK is exempt from the constraint), so rows with a NULL in any FK column are excluded.
+    /// </summary>
+    /// <param name="parentTables">Schema-qualified parent tables to audit (the tables this profile synced)</param>
+    /// <param name="syncedTables">All schema-qualified tables in the profile's scope, used to flag
+    /// orphans sitting in child tables this profile does not sync — those never self-heal.</param>
+    public async Task<List<OrphanFinding>> AuditReferentialIntegrityAsync(
+        IEnumerable<string> parentTables,
+        ISet<string> syncedTables)
+    {
+        const string constraintSql = @"
+            SELECT
+                con.conname AS ConstraintName,
+                ns_c.nspname || '.' || cl_c.relname AS ChildTable,
+                ns_p.nspname || '.' || cl_p.relname AS ParentTable,
+                (SELECT array_agg(a.attname ORDER BY x.ord)
+                   FROM unnest(con.conkey) WITH ORDINALITY x(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = con.conrelid AND a.attnum = x.attnum) AS ChildColumns,
+                (SELECT array_agg(a.attname ORDER BY x.ord)
+                   FROM unnest(con.confkey) WITH ORDINALITY x(attnum, ord)
+                   JOIN pg_attribute a ON a.attrelid = con.confrelid AND a.attnum = x.attnum) AS ParentColumns
+            FROM pg_constraint con
+            JOIN pg_class cl_c ON con.conrelid = cl_c.oid
+            JOIN pg_namespace ns_c ON cl_c.relnamespace = ns_c.oid
+            JOIN pg_class cl_p ON con.confrelid = cl_p.oid
+            JOIN pg_namespace ns_p ON cl_p.relnamespace = ns_p.oid
+            WHERE con.contype = 'f'
+              AND ns_p.nspname = @schemaName
+              AND cl_p.relname = @tableName";
+
+        var findings = new List<OrphanFinding>();
+
+        await using var connection = new NpgsqlConnection(_connectionString);
+        await connection.OpenAsync();
+
+        foreach (var parentTable in parentTables.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var (schema, table) = ParseTableName(parentTable);
+
+            List<ForeignKeyInfo> constraints;
+            try
+            {
+                var rows = await connection.QueryAsync<ForeignKeyInfo>(
+                    constraintSql,
+                    new { schemaName = schema, tableName = table },
+                    commandTimeout: _commandTimeout);
+                constraints = rows.ToList();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "RI audit: could not enumerate foreign keys for {Table}; skipping", parentTable);
+                continue;
+            }
+
+            foreach (var fk in constraints)
+            {
+                if (fk.ChildColumns is not { Length: > 0 } || fk.ParentColumns is not { Length: > 0 })
+                    continue;
+                if (fk.ChildColumns.Length != fk.ParentColumns.Length)
+                    continue;
+
+                var joinPredicate = string.Join(" AND ",
+                    fk.ChildColumns.Select((c, i) => $"p.\"{fk.ParentColumns[i]}\" = c.\"{c}\""));
+                var notNullPredicate = string.Join(" AND ",
+                    fk.ChildColumns.Select(c => $"c.\"{c}\" IS NOT NULL"));
+
+                var orphanSql = $@"
+                    SELECT COUNT(*)
+                    FROM {FormatTableNameForSql(fk.ChildTable)} c
+                    WHERE {notNullPredicate}
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {FormatTableNameForSql(fk.ParentTable)} p
+                          WHERE {joinPredicate})";
+
+                try
+                {
+                    var orphanCount = await connection.ExecuteScalarAsync<long>(
+                        orphanSql, commandTimeout: _commandTimeout);
+
+                    if (orphanCount > 0)
+                    {
+                        findings.Add(new OrphanFinding
+                        {
+                            ConstraintName = fk.ConstraintName,
+                            ChildTable = fk.ChildTable,
+                            ParentTable = fk.ParentTable,
+                            OrphanCount = orphanCount,
+                            ChildIsOutsideSyncScope = !syncedTables.Contains(fk.ChildTable)
+                        });
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // A child table we cannot read (permissions, dropped mid-audit) must not
+                    // fail the sync run — the audit is advisory.
+                    _logger.LogWarning(ex,
+                        "RI audit: orphan check failed for {Constraint} on {Child}; skipping",
+                        fk.ConstraintName, fk.ChildTable);
+                }
+            }
+        }
+
+        return findings;
+    }
+
+    private sealed class ForeignKeyInfo
+    {
+        public string ConstraintName { get; set; } = string.Empty;
+        public string ChildTable { get; set; } = string.Empty;
+        public string ParentTable { get; set; } = string.Empty;
+        public string[]? ChildColumns { get; set; }
+        public string[]? ParentColumns { get; set; }
+    }
+
+    /// <summary>
     /// When <see cref="DisableTriggersDuringLoad"/> is enabled, set
     /// <c>session_replication_role = 'replica'</c> on the connection so FK/RI triggers are
     /// suppressed for this session. If the user lacks the privilege, the set is skipped with

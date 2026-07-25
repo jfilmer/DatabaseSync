@@ -153,9 +153,48 @@ public class SyncRunResult
     /// <summary>
     /// Overall rows per second throughput
     /// </summary>
-    public double OverallRowsPerSecond => Duration.TotalSeconds > 0 
-        ? TotalRowsProcessed / Duration.TotalSeconds 
+    public double OverallRowsPerSecond => Duration.TotalSeconds > 0
+        ? TotalRowsProcessed / Duration.TotalSeconds
         : 0;
+
+    /// <summary>
+    /// Referential-integrity orphans found on the target after this run, one entry per
+    /// foreign-key constraint that has at least one child row with no surviving parent.
+    /// Populated only when ProfileOptions.AuditReferentialIntegrityAfterSync is enabled.
+    /// Empty is the expected, healthy state.
+    /// </summary>
+    public List<OrphanFinding> OrphanFindings { get; set; } = new();
+
+    /// <summary>
+    /// Total orphaned child rows found across all constraints in the post-sync RI audit
+    /// </summary>
+    public long TotalOrphanRows => OrphanFindings.Sum(f => f.OrphanCount);
+}
+
+/// <summary>
+/// One foreign-key constraint on the target whose child table holds rows pointing at a
+/// parent row that no longer exists. Produced by the post-sync referential-integrity audit.
+/// </summary>
+public class OrphanFinding
+{
+    /// <summary>Foreign key constraint name</summary>
+    public string ConstraintName { get; set; } = string.Empty;
+
+    /// <summary>Schema-qualified child table holding the orphaned rows</summary>
+    public string ChildTable { get; set; } = string.Empty;
+
+    /// <summary>Schema-qualified parent table whose rows went missing</summary>
+    public string ParentTable { get; set; } = string.Empty;
+
+    /// <summary>Number of child rows with no surviving parent</summary>
+    public long OrphanCount { get; set; }
+
+    /// <summary>
+    /// True when the child table is outside this profile's sync scope. These are the
+    /// dangerous ones: a synced child table's orphans self-heal on its own delete pass,
+    /// but an unsynced child table's orphans persist indefinitely (AIM #1497).
+    /// </summary>
+    public bool ChildIsOutsideSyncScope { get; set; }
 }
 
 /// <summary>
