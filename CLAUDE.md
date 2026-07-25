@@ -89,12 +89,18 @@ sudo systemctl start database-sync
 
 | Server | Role | SSH | Service Path | Profiles |
 |--------|------|-----|-------------|----------|
-| **win2** (win2.digsol.us) | SQL Server syncs | `ssh claude@win2.digsol.us` | `C:\Services\DatabaseSync` | LMP_Main, LMP_Archive, LMP_Account (profiles 1-6) |
-| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 7-10); acx all schemas (profile 11); rmp `rmp` schema (profile 12) |
+| **win2** (win2.digsol.us) | SQL Server syncs | `ssh claude@win2.digsol.us` | `C:\Services\DatabaseSync` | LMP_Main, LMP_Archive, LMP_Account (profiles 01-06) |
+| **ubu2** (ubu2.digsol.us) | PostgreSQL syncs | `ssh claude@ubu2.digsol.us` | `/opt/services/DatabaseSync` | emp `core`, `emp`, `nxs`, `wgo` schemas (profiles 07-10); acx all schemas (profile 11); rmp `rmp` schema (profile 12) |
 
 **Important**: Only deploy SQL Server profiles to win2 and PostgreSQL profiles to ubu2. Mixing causes errors (e.g., PG profiles on win2 fail trying to create `_sync_history` with restricted permissions).
 
-**Profile naming convention**: Profiles are numbered (7-CORE, 8-EMP, 9-NXS, 10-WGO, 11-ACX, 12-RMP) so alphabetical sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables. ACX and RMP each sync independently (separate databases).
+**Profile naming convention**: Profiles are numbered with a **ZERO-PADDED two-digit prefix** (`01-LMP_Main` … `07-CORE`, `08-EMP`, `09-NXS`, `10-WGO`, `11-ACX`, `12-RMP`) so that string sorting produces the correct execution order. CORE must sync first since emp, nxs, and wgo schemas have foreign keys to core tables. ACX and RMP each sync independently (separate databases).
+
+> 🔴 **The padding is load-bearing — an unpadded set silently runs in the WRONG ORDER.** Both sort sites compare `ProfileName`/filename as **strings** (`Services/ProfileLoader.cs:77` for load order, `Program.cs:309` for `POST /sync`), and `"10" < "7"` lexically. From the day WGO was renumbered to 10 until 2026-07-25 the live order was `10-WGO, 11-ACX, 12-RMP, 7-CORE, 8-EMP, 9-NXS` — **CORE ran fourth, after WGO**, exactly inverting the documented cross-schema FK guarantee. This CLAUDE.md asserted the opposite the whole time.
+>
+> It never surfaced as an error because `DisableTriggersDuringLoad` suppresses the FK enforcement that would have made mis-ordering loud, and a full cycle converges anyway once CORE eventually runs — the same "the flag masks an ordering problem" theme as AIM #1497. Do not rely on that: remove the flag, or have CORE fail mid-cycle, and it becomes real.
+>
+> **When renaming a profile, set `ProfileId` to the OLD name.** `_sync_history` is keyed on `EffectiveProfileId`, which prefers `ProfileId` and falls back to `ProfileName` (`Configuration/SyncServiceConfig.cs:238`). Without the pin, a rename orphans all prior history and every Incremental table silently reverts to a full first sync. All nine renamed profiles carry the pin; verified post-rename that history still resolves (5,849 rows for CORE back to 2026-03-03, and win2's `01-LMP_Main` still returns its runs).
 
 **RMP database sync** (profile `12-RMP-prodpgsql-devpgsql`, done 2026-06-22): mirrors the `rmp` schema of the `rmp` database prod→dev (39 tables; FullRefresh + DeleteMode Sync + `DisableTriggersDuringLoad`, daily 05:00). Excluded: `public.spatial_ref_sys` (PostGIS system table), `schemaversions` (DbUp migration tracking — per-environment), and `refresh_tokens`/`password_reset_tokens` (auto-skipped by Rule #132). PostGIS `geography` columns (`communities.geo_boundary`, `listings.geo_point`) sync via the USER-DEFINED `::text` cast (verified md5-identical); generated `listings.description_tsv` is auto-excluded and recomputed on the target. **One-time dev-side setup performed** (target `rmpdev` is a restricted user): `GRANT SET ON PARAMETER session_replication_role TO rmpdev`; `GRANT UPDATE ON ALL SEQUENCES IN SCHEMA rmp TO rmpdev` + matching `ALTER DEFAULT PRIVILEGES FOR ROLE claude`; and `_sync_history` pre-created in the **public** schema (NOT `rmp`) — the rmp database's `search_path = "rmp, public"` means an unqualified create lands in `rmp`, but `PostgreSqlSyncHistoryRepository.InitializeAsync` only existence-checks `public`, so it must live in `public` or the service tries (and fails) to CREATE it as the restricted user.
 
@@ -113,7 +119,7 @@ ssh claude@win2.digsol.us "sc stop DatabaseSync"
 scp /tmp/DatabaseSync-publish/*.* claude@win2.digsol.us:"C:/Services/DatabaseSync/"
 
 # 4. Copy profile configs (SQL Server profiles only, 1-6)
-scp profiles/[1-6]*.json claude@win2.digsol.us:"C:/Services/DatabaseSync/profiles/"
+scp profiles/0[1-6]*.json claude@win2.digsol.us:"C:/Services/DatabaseSync/profiles/"
 
 # 5. Start the service
 ssh claude@win2.digsol.us "sc start DatabaseSync"
@@ -123,7 +129,7 @@ ssh claude@win2.digsol.us "sc query DatabaseSync"
 ssh claude@win2.digsol.us "curl -s http://localhost:5123/health"
 ```
 
-**Important**: Step 3 uses `scp *.* ` (flat files only) instead of `scp -r` to prevent the `profiles/` directory (which contains all profiles including PG profiles 7-10) from being copied to win2. Never use `scp -r` for the full publish directory — it will deploy PG profiles to win2, causing the dashboard to show PostgreSQL schemas that belong on ubu2. Note: `rsync` is not available on win2's PATH, so use `scp` for file transfer.
+**Important**: Step 3 uses `scp *.* ` (flat files only) instead of `scp -r` to prevent the `profiles/` directory (which contains all profiles including PG profiles 07-12) from being copied to win2. Never use `scp -r` for the full publish directory — it will deploy PG profiles to win2, causing the dashboard to show PostgreSQL schemas that belong on ubu2. Note: `rsync` is not available on win2's PATH, so use `scp` for file transfer.
 
 **Logs on win2**: `D:\Logs\DatabaseSync\sync-YYYYMMDD.log`
 
@@ -152,7 +158,7 @@ scp -r /tmp/DatabaseSync-publish-linux/* claude@ubu2.digsol.us:/tmp/DatabaseSync
 ssh claude@ubu2.digsol.us "sudo rsync -a --exclude 'profiles/' /tmp/DatabaseSync-deploy/ /opt/services/DatabaseSync/ && sudo chown -R www-data:www-data /opt/services/DatabaseSync/"
 
 # 5. Update profiles only when changed (PG profiles only, 7-10)
-scp profiles/[7-9]*.json profiles/10*.json claude@ubu2.digsol.us:/tmp/DatabaseSync-deploy/
+scp profiles/0[7-9]*.json profiles/1[0-2]*.json claude@ubu2.digsol.us:/tmp/DatabaseSync-deploy/
 ssh claude@ubu2.digsol.us "sudo cp /tmp/DatabaseSync-deploy/*.json /opt/services/DatabaseSync/profiles/ && sudo chown www-data:www-data /opt/services/DatabaseSync/profiles/*.json"
 
 # 6. Start the service
@@ -237,6 +243,45 @@ Sync profiles drift over time as application schemas evolve — tables get added
    - Cross-schema FKs (e.g., `wgo.promotions` → `core.users`) are handled by profile execution order, not within-profile priority
 
 5. **Update profiles**: Add missing tables, remove stale entries, deploy to ubu2, and verify table counts via the health API.
+
+6. **Check every new table has a PRIMARY KEY before adding it.** The upsert requires one; a PK-less table fails the whole table with `No primary key found - cannot perform upsert` and drops the profile to `success=false`. Caught the hard way 2026-07-25: `wgo.trending_chip_counts` was added from the missing-tables list and immediately failed, because it has no PK. Query it up front:
+   ```sql
+   SELECT t.table_schema||'.'||t.table_name,
+          COALESCE((SELECT string_agg(kcu.column_name,',')
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name=kcu.constraint_name AND tc.table_schema=kcu.table_schema
+                    WHERE tc.table_schema=t.table_schema AND tc.table_name=t.table_name
+                      AND tc.constraint_type='PRIMARY KEY'), '(NONE)') AS pk
+   FROM information_schema.tables t WHERE t.table_schema||'.'||t.table_name IN (/* candidates */);
+   ```
+
+7. **Grant sequence UPDATE for any newly-covered schema** — see the sequence-permissions note under Database User Conventions. Adding tables from a schema the sync user has never written to means its sequences were never granted.
+
+### Audit results — 2026-07-25 (run against prod, AIM #1497 follow-up)
+
+Compared all six PG profiles against `prodpgsql`. **9 tables were missing, 3 were stale.**
+
+Added (priority from FK depth within each profile; cross-schema FKs are handled by profile order, not priority):
+
+| Profile | Table | Priority | Parents |
+|---|---|---|---|
+| 07-CORE | `core.user_push_subscriptions` | 2 | core.users (P1) |
+| 07-CORE | `core.curator_activity` | 3 | core.curators (P2) |
+| 07-CORE | `core.curator_favorite_genres_tags` | 4 | core.curator_favorite_genres (P3) |
+| 07-CORE | `core.curator_favorite_talent_tags` | 4 | core.curator_favorite_talent (P3) |
+| 07-CORE | `core.curator_favorite_events_tags` | 6 | core.curator_favorite_events (P5) |
+| 08-EMP | `emp.comp_issuances` | 1 | core.events/users only (cross-schema) |
+| 08-EMP | `emp.refund_authorizations` | 1 | core.events/users only (cross-schema) |
+| 09-NXS | `nxs.event_setlists` | 4 | nxs.setlists (P3) |
+
+Removed as stale — these did not vanish, they **moved to the `core` schema** and were restructured: `wgo.curator_activity` → `core.curator_activity`, and `wgo.curator_genres` / `wgo.curator_tags` → the three `core.curator_favorite_*_tags` tables. A profile entry that logs `source table not found` is worth chasing rather than deleting; the table is often alive under a new name.
+
+Rejected: `wgo.trending_chip_counts` — exists in prod but has **no primary key** (see step 6).
+
+**Dev-only tables are not drift.** Seven `emp.guest_*`/`emp.comp_*` tables show up when the comparison is run against *dev* but are absent from prod, so they are correctly uncovered. Always compare against **prod**, which is the source of truth for what a mirror should carry.
+
+Post-audit table counts: 07-CORE 42, 08-EMP 5, 09-NXS 15, 10-WGO 38, 11-ACX 55, 12-RMP 39.
 
 ### Tables and Data That Cannot or Should Not Sync
 
@@ -1040,6 +1085,8 @@ Set to `0` to disable automatic recovery.
 
 **Prove these fire before trusting a green result.** A clean "no orphans found" is indistinguishable from an audit that never ran. All three were proven with controlled probes 2026-07-25 (plant an orphan by deleting a parent under `session_replication_role='replica'`; temporarily set `MaxDeletePercent: 1` and insert 8 dev-only rows into a 233-row table). Probe recipes and the observed log lines are in `devdocs/core-events-sync-stuck-fk-recovery.md`.
 
+**First real catch — auto-excluded child tables under a mirrored parent (RMP, 2026-07-25).** The audit's first production run flagged **138 orphaned `rmp.refresh_tokens` (83% of the table) + 2 `rmp.password_reset_tokens`**, all pointing at deleted `rmp.users`. The mechanism is structural and will recur on any profile in this shape: token/session tables are **auto-excluded from sync by Rule #132**, but their parent `users` table **is** mirrored — so every parity delete of a user strands that user's dev-side tokens, with no sync pass that would ever clean them up. Harm is low (dead tokens just fail auth) but it is genuine RI corruption under a validated FK, and it accumulates indefinitely. Cleaned 2026-07-25 (140 rows deleted, audit now clean). Expect it again after any large user-set change; the fix is a periodic delete, not a config change.
+
 ### Dev test fixtures on a prod→dev mirror
 
 A full-parity mirror deletes any target row absent from the source — so **every dev-only test account in a mirrored table vanishes on the next sync**. This is why the documented FAF dev account `faftest@digsol.us` and the #1287 fixture `payouttest1287@digsol.us` did not exist when someone went looking for them. It is the more frequent day-to-day pain of the two consequences above, and it feeds the first one (a deleted `core.users` row orphans everything in `faf` that references it).
@@ -1247,14 +1294,14 @@ This ensures `order_items` referencing `orders` are deleted before the parent `o
 
 ### Profile Ordering
 
-When multiple profiles share a database and have cross-schema foreign key dependencies, **execution order matters**. Profiles are sorted alphabetically by `ProfileName` before execution, both for scheduled runs (`ProfileExecutionMode: Sequential`) and HTTP-triggered syncs (`POST /sync`).
+When multiple profiles share a database and have cross-schema foreign key dependencies, **execution order matters**. Profiles are sorted **as strings** by `ProfileName`/filename before execution, both for scheduled runs (`ProfileExecutionMode: Sequential`) and HTTP-triggered syncs (`POST /sync`). String sorting is why the numeric prefix must be **zero-padded to two digits** — see the naming-convention warning above; an unpadded `7-` sorts *after* `10-`.
 
-Use numbered prefixes to control execution order:
+Use zero-padded numbered prefixes to control execution order:
 
 ```
-7-CORE-prodpgsql-devpgsql    ← Runs first  (core.users, core.events, core.talent, etc.)
-8-EMP-prodpgsql-devpgsql     ← Runs second (emp.user_event_assignments → core.events)
-9-NXS-prodpgsql-devpgsql     ← Runs third  (nxs.songs, nxs.setlists, etc.)
+07-CORE-prodpgsql-devpgsql   ← Runs first  (core.users, core.events, core.talent, etc.)
+08-EMP-prodpgsql-devpgsql    ← Runs second (emp.user_event_assignments → core.events)
+09-NXS-prodpgsql-devpgsql    ← Runs third  (nxs.songs, nxs.setlists, etc.)
 10-WGO-prodpgsql-devpgsql    ← Runs fourth (wgo.event_clicks → core.events)
 11-ACX-prodpgsql-devpgsql    ← Runs next   (acx database, all schemas — independent)
 12-RMP-prodpgsql-devpgsql    ← Runs last   (rmp database, rmp schema — independent)
@@ -1512,6 +1559,21 @@ The `TypeMapper` class handles type conversion between databases:
 > ```
 >
 > Run both statements for **every schema** the sync user targets. The `ALTER DEFAULT PRIVILEGES` ensures new tables with IDENTITY columns automatically get the correct grants — no manual intervention needed when schemas evolve.
+>
+> 🔴 **Two ways this silently rots, both found live 2026-07-25:**
+>
+> 1. **A newly-synced schema is never granted.** When ACX's 12 `media.*` tables were added (AIM #1281), the grants were not extended to the `media` schema — `acxdev` had UPDATE on **0 of 8** `media` sequences (also 0 in `core` and `public`). Every run logged `42501: permission denied for sequence <name>` and skipped the `setval()`, so those sequences never advanced past their dev values. Fixed by granting UPDATE + `ALTER DEFAULT PRIVILEGES` on `media`, `core`, and `public`; the warnings went to zero on the next run.
+> 2. **`ALTER DEFAULT PRIVILEGES FOR ROLE claude` does not cover objects created by `postgres`.** Default privileges are per-granting-role. The three sequences still ungranted in the `emp` database (`core.user_push_subscriptions_*`, `nxs.event_setlists_*`, `wgo.trending_chip_counts_*`) are all owned by `postgres`, not `claude`. **Add a matching `FOR ROLE postgres` line** whenever tables may be created by either role.
+>
+> These failures are *logged*, not silent — but they appear as `WRN` amid a green run, so nothing draws attention to them. Audit with:
+> ```sql
+> SELECT n.nspname AS schema, count(*) AS sequences,
+>        count(*) FILTER (WHERE has_sequence_privilege('<sync_user>', c.oid, 'UPDATE')) AS can_update
+> FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+> WHERE c.relkind = 'S' AND n.nspname NOT LIKE 'pg\_%'
+> GROUP BY 1 ORDER BY 1;
+> ```
+> (Filter on `relkind='S'` inside a `MATERIALIZED` CTE if you also select per-sequence detail — otherwise the planner may evaluate `has_sequence_privilege` against indexes and error with `"<name>" is not a sequence`.)
 
 **Pre-creating sync history table**: When using restricted database users without CREATE permission, the `_sync_history` table must be pre-created by an admin user. Run the following SQL with a privileged user (e.g., `postgres` or `claude`):
 
@@ -1600,4 +1662,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated (2026-07-25, AIM #1497): Closed the blast-radius gap that `DisableTriggersDuringLoad` opened — suppressing RI on the target also unguards the ordinary parity-delete, which silently orphaned `faf` rows (the one schema with no sync profile: 35 FKs into `core`) and destroyed every dev-only test account in mirrored `core.*` tables. Three additions: `AuditReferentialIntegrityAfterSync` (post-run orphan count over `pg_constraint`, flags child tables outside sync scope), `DeleteExclusionFilter` (target-side WHERE exempting dev fixtures from parity deletes; convention is a `+devfixture@` email), and `MaxDeletePercent` (ratio ceiling — the PG delete path previously had NO safety check, unlike the SQL Server path). Deliberately did NOT narrow the `session_replication_role` scope: it is load-bearing on the delete path for `core.events`' self-FK. All three proven with controlled probes, not just observed green. Enabled on all 6 PG mirror profiles. Also fixed a nine-day silent outage: `empdev` was rotated 2026-07-16 (AIM #1517) and the gitignored profile files were never updated, so 7-CORE/8-EMP/9-NXS/10-WGO had failed nightly with 28P01 while `systemctl is-active` still reported healthy. Prior: Added profile 12-RMP-prodpgsql-devpgsql (rmp database, rmp schema, 39 tables, prod→dev mirror, daily 05:00, DisableTriggersDuringLoad) — RMP is now on ubu1 so the long-standing TODO is done. First PostGIS sync: `geography` columns round-trip via the USER-DEFINED `::text` cast (md5-identical), generated `listings.description_tsv` auto-excluded/recomputed. Excluded spatial_ref_sys, schemaversions, and token tables. Dev-side one-time setup: granted rmpdev the session_replication_role param + sequence UPDATEs, and pre-created `_sync_history` in **public** (the rmp DB's search_path puts rmp first, but the repo only existence-checks public). Verified 39/39 tables, counts match prod. Also cleaned 4 stray non-profile files (appsettings*.json, *.deps.json, *.runtimeconfig.json) out of ubu2's profiles/ dir that were being misparsed as a phantom 'Default' profile. Prior: Added all 12 `media.*` tables to profile 11-ACX (prod→dev mirror) for the ACX media catalog — AIM task #1281 (task listed 8; prod had drifted to 12: +face, +file_action, +person, +thumbnail). Fixed two latent PG→PG bugs the first non-null pgvector data exposed: (1) reading a `vector` threw because the try/catch fallback's `GetFieldValue<string>` is unsupported for `vector` — now the source SELECT casts USER-DEFINED columns to `::text` (covers vector + enums uniformly); (2) `media.image_meta.search_vector` is GENERATED ALWAYS STORED and can't be inserted into — generated columns are now auto-excluded (detected via `is_generated='ALWAYS'`) and recomputed on the target. Verified: 55/55 tables, all 12 media counts match prod, vector values md5-identical, search_vector recomputed on dev. Prior: added `DisableTriggersDuringLoad` (session_replication_role='replica') to unstick `core.events` PG→PG mirror sync where self-referential/inbound FKs blocked unique-constraint recovery and orphan deletes — enabled on all 5 PG mirror profiles, granted the GUC parameter to empdev/acxdev on devpgsql; added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*
+*Last Updated (2026-07-25, AIM #1497 + follow-ups): **Profile prefixes are now ZERO-PADDED (01-12)** — both sort sites compare strings, so `"10" < "7"` meant CORE was running FOURTH, after WGO, inverting the documented cross-schema FK order ever since WGO became profile 10. Masked all along by DisableTriggersDuringLoad suppressing the FKs that would have made it loud. Every renamed profile pins `ProfileId` to its old name so `_sync_history` stays continuous (verified: CORE still resolves 5,849 rows back to 2026-03-03, win2's 01-LMP_Main still returns its runs). **Profile drift audited against prod**: 9 missing tables added (5 core, 2 emp, 1 nxs), 3 stale `wgo.curator_*` entries removed — they had MOVED to the core schema, not vanished — and `wgo.trending_chip_counts` rejected because it has no PK (the upsert requires one). **ACX sequence grants fixed**: acxdev had UPDATE on 0 of 8 `media.*` sequences since #1281, so every run logged 42501 and skipped the setval; also learned `ALTER DEFAULT PRIVILEGES FOR ROLE claude` does NOT cover `postgres`-owned objects. **RI audit's first real catch**: 140 orphaned RMP token rows under deleted users — structural, since token tables are Rule-#132-excluded while their parent users table is mirrored; cleaned. Prior in this pass: Closed the blast-radius gap that `DisableTriggersDuringLoad` opened — suppressing RI on the target also unguards the ordinary parity-delete, which silently orphaned `faf` rows (the one schema with no sync profile: 35 FKs into `core`) and destroyed every dev-only test account in mirrored `core.*` tables. Three additions: `AuditReferentialIntegrityAfterSync` (post-run orphan count over `pg_constraint`, flags child tables outside sync scope), `DeleteExclusionFilter` (target-side WHERE exempting dev fixtures from parity deletes; convention is a `+devfixture@` email), and `MaxDeletePercent` (ratio ceiling — the PG delete path previously had NO safety check, unlike the SQL Server path). Deliberately did NOT narrow the `session_replication_role` scope: it is load-bearing on the delete path for `core.events`' self-FK. All three proven with controlled probes, not just observed green. Enabled on all 6 PG mirror profiles. Also fixed a nine-day silent outage: `empdev` was rotated 2026-07-16 (AIM #1517) and the gitignored profile files were never updated, so 7-CORE/8-EMP/9-NXS/10-WGO had failed nightly with 28P01 while `systemctl is-active` still reported healthy. Prior: Added profile 12-RMP-prodpgsql-devpgsql (rmp database, rmp schema, 39 tables, prod→dev mirror, daily 05:00, DisableTriggersDuringLoad) — RMP is now on ubu1 so the long-standing TODO is done. First PostGIS sync: `geography` columns round-trip via the USER-DEFINED `::text` cast (md5-identical), generated `listings.description_tsv` auto-excluded/recomputed. Excluded spatial_ref_sys, schemaversions, and token tables. Dev-side one-time setup: granted rmpdev the session_replication_role param + sequence UPDATEs, and pre-created `_sync_history` in **public** (the rmp DB's search_path puts rmp first, but the repo only existence-checks public). Verified 39/39 tables, counts match prod. Also cleaned 4 stray non-profile files (appsettings*.json, *.deps.json, *.runtimeconfig.json) out of ubu2's profiles/ dir that were being misparsed as a phantom 'Default' profile. Prior: Added all 12 `media.*` tables to profile 11-ACX (prod→dev mirror) for the ACX media catalog — AIM task #1281 (task listed 8; prod had drifted to 12: +face, +file_action, +person, +thumbnail). Fixed two latent PG→PG bugs the first non-null pgvector data exposed: (1) reading a `vector` threw because the try/catch fallback's `GetFieldValue<string>` is unsupported for `vector` — now the source SELECT casts USER-DEFINED columns to `::text` (covers vector + enums uniformly); (2) `media.image_meta.search_vector` is GENERATED ALWAYS STORED and can't be inserted into — generated columns are now auto-excluded (detected via `is_generated='ALWAYS'`) and recomputed on the target. Verified: 55/55 tables, all 12 media counts match prod, vector values md5-identical, search_vector recomputed on dev. Prior: added `DisableTriggersDuringLoad` (session_replication_role='replica') to unstick `core.events` PG→PG mirror sync where self-referential/inbound FKs blocked unique-constraint recovery and orphan deletes — enabled on all 5 PG mirror profiles, granted the GUC parameter to empdev/acxdev on devpgsql; added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*
