@@ -57,6 +57,14 @@ public class PostgreSqlBulkDataCopier
     /// </summary>
     public bool DisableTriggersDuringLoad { get; set; } = false;
 
+    /// <summary>
+    /// Safety ceiling on synchronized deletes, as a percentage of the target table's row count.
+    /// A delete pass that would remove more than this share of the target is aborted for that
+    /// table and logged as an error. Set to 0 to disable the check (default).
+    /// See <see cref="ProfileOptions.MaxDeletePercent"/>.
+    /// </summary>
+    public int MaxDeletePercent { get; set; } = 0;
+
     // Tracks whether we've already logged a warning about lacking privilege to set the GUC,
     // so a non-superuser target user doesn't spam the log once per table.
     private bool _replicaRoleWarningLogged;
@@ -215,7 +223,7 @@ public class PostgreSqlBulkDataCopier
             if (config.DeleteMode == DeleteMode.Sync && !skipDelete)
             {
                 result.RowsDeleted = await SyncDeletesAsync(
-                    sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter);
+                    sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config);
             }
 
             _logger.LogInformation(
@@ -242,7 +250,7 @@ public class PostgreSqlBulkDataCopier
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> columns,
-        string? sourceFilter)
+        TableConfig config)
     {
         var pkColumns = columns.Where(c => c.IsPrimaryKey).ToList();
         if (!pkColumns.Any())
@@ -265,7 +273,7 @@ public class PostgreSqlBulkDataCopier
         // reverse priority order aren't blocked by self-referential or inbound foreign keys.
         await SetReplicaRoleIfEnabledAsync(targetConn);
 
-        return await SyncDeletesAsync(sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, sourceFilter);
+        return await SyncDeletesAsync(sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config);
     }
 
     /// <summary>
@@ -384,7 +392,7 @@ public class PostgreSqlBulkDataCopier
             if (config.DeleteMode == DeleteMode.Sync && config.SyncAllDeletes && !skipDelete)
             {
                 result.RowsDeleted = await SyncDeletesAsync(
-                    sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config.SourceFilter);
+                    sourceConn, targetConn, sourceTableName, targetTableName, pkColumns, config);
             }
             else if (config.DeleteMode == DeleteMode.Sync && !config.SyncAllDeletes && !skipDelete)
             {
@@ -1042,7 +1050,7 @@ public class PostgreSqlBulkDataCopier
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> pkColumns,
-        string? sourceFilter)
+        TableConfig config)
     {
         _logger.LogInformation("Syncing deletes: comparing primary keys...");
 
@@ -1051,7 +1059,7 @@ public class PostgreSqlBulkDataCopier
             Microsoft.Extensions.Logging.Abstractions.NullLogger<PostgreSqlSchemaAnalyzer>.Instance,
             _commandTimeout);
 
-        var sourcePks = await sourceAnalyzer.GetPrimaryKeyValuesAsync(sourceTableName, pkColumns, sourceFilter);
+        var sourcePks = await sourceAnalyzer.GetPrimaryKeyValuesAsync(sourceTableName, pkColumns, config.SourceFilter);
         _logger.LogDebug("Found {Count:N0} rows in source", sourcePks.Count);
 
         var targetAnalyzer = new PostgreSqlSchemaAnalyzer(
@@ -1069,10 +1077,59 @@ public class PostgreSqlBulkDataCopier
 
         var pksToDelete = targetPks.Except(sourcePks).ToList();
 
+        // Protect dev-only fixture rows: any target row matching DeleteExclusionFilter is removed
+        // from the delete set, so a full-parity mirror leaves it alone even though the source has
+        // no such row. Without this, every dev-only row in a mirrored table is destroyed on the
+        // next run (AIM #1497 — core.users test accounts).
+        if (pksToDelete.Any() && !string.IsNullOrWhiteSpace(config.DeleteExclusionFilter))
+        {
+            var protectedPks = await targetAnalyzer.GetPrimaryKeyValuesAsync(
+                targetTableName, pkColumns, config.DeleteExclusionFilter);
+
+            var before = pksToDelete.Count;
+            pksToDelete = pksToDelete.Except(protectedPks).ToList();
+            var excluded = before - pksToDelete.Count;
+
+            if (excluded > 0)
+            {
+                _logger.LogInformation(
+                    "Delete exclusion filter protected {Count:N0} dev-only rows in {Table} (filter: {Filter})",
+                    excluded, targetTableName, config.DeleteExclusionFilter);
+            }
+        }
+
         if (!pksToDelete.Any())
         {
             _logger.LogDebug("No rows to delete");
             return 0;
+        }
+
+        // Safety ceiling: refuse to delete more than MaxDeletePercent of the target table.
+        // Catches a source that returned no/partial rows, a wrong SourceFilter, or a profile
+        // pointed at the wrong database — any of which otherwise empties the target silently.
+        // The percentage is only meaningful on a table with enough rows for a ratio to mean
+        // something — on a 12-row lookup table a routine 4-row delete is 33% and would trip
+        // any sane threshold. Small tables are guarded by DeleteExclusionFilter instead.
+        const int minRowsForRatioCheck = 100;
+
+        if (MaxDeletePercent > 0 && targetPks.Count >= minRowsForRatioCheck)
+        {
+            var deletePercent = pksToDelete.Count * 100.0 / targetPks.Count;
+            if (deletePercent > MaxDeletePercent)
+            {
+                _logger.LogError(
+                    "ABORTING delete for {Table}: would delete {Count:N0} of {Total:N0} target rows " +
+                    "({Percent:F1}%), exceeding MaxDeletePercent of {Max}%. Source returned {SourceCount:N0} rows. " +
+                    "No rows deleted. If this delete is intentional, raise MaxDeletePercent on the profile " +
+                    "or run the table once with DeleteMode=None and reconcile manually.",
+                    targetTableName, pksToDelete.Count, targetPks.Count, deletePercent,
+                    MaxDeletePercent, sourcePks.Count);
+                return 0;
+            }
+
+            _logger.LogDebug(
+                "Delete ratio for {Table}: {Count:N0} of {Total:N0} ({Percent:F1}%), within {Max}%",
+                targetTableName, pksToDelete.Count, targetPks.Count, deletePercent, MaxDeletePercent);
         }
 
         _logger.LogInformation("Deleting {Count:N0} rows from target", pksToDelete.Count);

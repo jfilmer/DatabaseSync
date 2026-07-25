@@ -728,6 +728,37 @@ public class ProfileOptions
     /// See devdocs/core-events-sync-stuck-fk-recovery.md.
     /// </summary>
     public bool DisableTriggersDuringLoad { get; set; } = false;
+
+    /// <summary>
+    /// Safety ceiling on synchronized deletes, as a percentage of the target table's row count.
+    /// When a delete pass would remove more than this share of the target table, the delete is
+    /// aborted for that table (logged as an error) and the sync continues with 0 deletes.
+    ///
+    /// Guards against the unbounded-delete hole in the PostgreSQL delete path: unlike the
+    /// SQL Server path, target-minus-source set subtraction had no ratio check at all, so a
+    /// misconfigured source (or a source that failed to return rows) could empty a target table.
+    ///
+    /// Set to 0 to disable the check (default, preserving pre-existing behavior for the
+    /// SQL Server profiles). Recommended: 25 on prod->dev mirror profiles.
+    /// </summary>
+    public int MaxDeletePercent { get; set; } = 0;
+
+    /// <summary>
+    /// PostgreSQL targets only: after a profile run completes, audit referential integrity on
+    /// the target by counting child rows whose parent no longer exists, for every inbound
+    /// foreign key of every table this profile synced. Orphans are logged as a WARNING with
+    /// per-constraint counts.
+    ///
+    /// This exists because <see cref="DisableTriggersDuringLoad"/> suppresses the RI triggers
+    /// that would otherwise have RESTRICTed an orphaning delete. The audit restores the signal
+    /// without restoring the FK blocking that the flag was added to remove. It also catches
+    /// orphans created by legitimate prod-side deletes cascading into schemas that have no sync
+    /// profile of their own (the `faf` schema is the live example — 35 FKs into `core`, no profile).
+    ///
+    /// Read-only; never modifies data. Default: false.
+    /// See AIM task #1497 and devdocs/core-events-sync-stuck-fk-recovery.md.
+    /// </summary>
+    public bool AuditReferentialIntegrityAfterSync { get; set; } = false;
 }
 
 /// <summary>
@@ -813,4 +844,23 @@ public class TableConfig
     /// Example: "IsActive = 1" or "CreatedDate > '2020-01-01'"
     /// </summary>
     public string? SourceFilter { get; set; }
+
+    /// <summary>
+    /// Optional WHERE clause (without the WHERE keyword) evaluated against the TARGET table that
+    /// protects matching rows from synchronized deletes. Rows matching this predicate are excluded
+    /// from the target-vs-source primary key comparison, so a full-parity mirror will never delete
+    /// them even though they do not exist in the source.
+    ///
+    /// The intended use is protecting dev-only test fixtures on a prod->dev mirror. A full-parity
+    /// sync of a table like core.users otherwise deletes every dev-only account on its next run,
+    /// silently destroying test fixtures and orphaning any child rows that reference them in
+    /// schemas outside the sync scope.
+    ///
+    /// Example: "email LIKE '%+devfixture@%'"
+    ///
+    /// Applies to the PostgreSQL delete path only. Never set this on a profile whose target is
+    /// production — it deliberately lets the target diverge from the source.
+    /// See AIM task #1497.
+    /// </summary>
+    public string? DeleteExclusionFilter { get; set; }
 }

@@ -171,7 +171,8 @@ public class SyncOrchestrator
                     profile.Options.CommandTimeoutSeconds)
                 {
                     SourceBatchSize = profile.Options.SourceBatchSize,
-                    DisableTriggersDuringLoad = profile.Options.DisableTriggersDuringLoad
+                    DisableTriggersDuringLoad = profile.Options.DisableTriggersDuringLoad,
+                    MaxDeletePercent = profile.Options.MaxDeletePercent
                 };
                 break;
 
@@ -679,7 +680,7 @@ public class SyncOrchestrator
 
                         _logger.LogInformation("Syncing deletes for {Table}...", tableConfig.SourceTable);
                         var deletedCount = await ExecuteDeleteSyncAsync(
-                            sourceTableName, targetTableName, schema, tableConfig.SourceFilter);
+                            sourceTableName, targetTableName, schema, tableConfig);
 
                         if (deletedCount > 0)
                         {
@@ -703,12 +704,83 @@ public class SyncOrchestrator
             }
         }
 
+        // Post-sync referential-integrity audit. DisableTriggersDuringLoad suppresses the RI
+        // triggers that would otherwise have RESTRICTed an orphaning delete, so orphans are
+        // created silently — this is the detection that replaces that protection (AIM #1497).
+        if (_profile.Options.AuditReferentialIntegrityAfterSync)
+        {
+            await RunReferentialIntegrityAuditAsync(runResult, filteredTables);
+        }
+
         runResult.TableResults = results.ToList();
         runResult.EndTime = DateTime.UtcNow;
 
         LogSyncSummary(runResult);
 
         return runResult;
+    }
+
+    /// <summary>
+    /// Count child rows on the target whose parent no longer exists, for every inbound foreign
+    /// key of every table this profile synced. Advisory only — findings are logged and recorded
+    /// on the run result, never repaired, and an audit failure never fails the sync run.
+    /// </summary>
+    private async Task RunReferentialIntegrityAuditAsync(
+        SyncRunResult runResult,
+        List<TableConfig> syncedTableConfigs)
+    {
+        if (_targetAnalyzer is not PostgreSqlSchemaAnalyzer pgTargetAnalyzer)
+        {
+            _logger.LogDebug("RI audit skipped: only implemented for PostgreSQL targets");
+            return;
+        }
+
+        try
+        {
+            var targetTables = syncedTableConfigs
+                .Select(GetEffectiveTargetTableName)
+                .ToList();
+
+            var syncedTableSet = new HashSet<string>(targetTables, StringComparer.OrdinalIgnoreCase);
+
+            _logger.LogInformation(
+                "Auditing referential integrity on target for {Count} synced tables...", targetTables.Count);
+
+            var findings = await pgTargetAnalyzer.AuditReferentialIntegrityAsync(targetTables, syncedTableSet);
+            runResult.OrphanFindings = findings;
+
+            if (findings.Count == 0)
+            {
+                _logger.LogInformation("RI audit: no orphaned rows found");
+                return;
+            }
+
+            // Orphans in a child table this profile also syncs will be swept by that table's own
+            // delete pass. Orphans outside the sync scope will not — they persist until someone
+            // cleans them up by hand, which is the silent corruption this audit exists to surface.
+            var outsideScope = findings.Where(f => f.ChildIsOutsideSyncScope).ToList();
+
+            _logger.LogWarning(
+                "RI audit found {Total:N0} orphaned rows across {Count} foreign keys " +
+                "({OutsideCount} in tables outside this profile's sync scope)",
+                findings.Sum(f => f.OrphanCount), findings.Count, outsideScope.Count);
+
+            foreach (var finding in findings.OrderByDescending(f => f.OrphanCount))
+            {
+                var scopeNote = finding.ChildIsOutsideSyncScope
+                    ? "OUTSIDE SYNC SCOPE - will not self-heal"
+                    : "in sync scope - should clear on next full run";
+
+                _logger.LogWarning(
+                    "  {Count:N0} orphans in {Child} -> {Parent} via {Constraint} ({Scope})",
+                    finding.OrphanCount, finding.ChildTable, finding.ParentTable,
+                    finding.ConstraintName, scopeNote);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "RI audit failed; sync results are unaffected");
+        }
     }
 
     private void LogTableResult(SyncResult result)
@@ -944,13 +1016,13 @@ CREATE TABLE [{tableName}] (
         string sourceTableName,
         string targetTableName,
         List<ColumnInfo> columns,
-        string? sourceFilter)
+        TableConfig config)
     {
         // Currently only PostgreSQL-to-PostgreSQL supports separate delete sync
         if (_sourceDatabaseType == DatabaseType.PostgreSql && _targetDatabaseType == DatabaseType.PostgreSql)
         {
             return await _postgreSqlToPostgreSqlCopier!.PerformDeleteSyncAsync(
-                sourceTableName, targetTableName, columns, sourceFilter);
+                sourceTableName, targetTableName, columns, config);
         }
 
         // For other combinations, log a warning - deletes should be handled inline
