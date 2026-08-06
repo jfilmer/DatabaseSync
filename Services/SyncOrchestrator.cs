@@ -85,14 +85,14 @@ public class SyncOrchestrator
         if (_sourceDatabaseType == DatabaseType.SqlServer)
         {
             _sourceAnalyzer = new SqlServerSchemaAnalyzer(
-                profile.SourceConnection.ConnectionString,
+                profile.SourceConnection.EffectiveConnectionString,
                 sqlSourceLogger,
                 profile.Options.CommandTimeoutSeconds);
         }
         else if (_sourceDatabaseType == DatabaseType.PostgreSql)
         {
             _sourceAnalyzer = new PostgreSqlSchemaAnalyzer(
-                profile.SourceConnection.ConnectionString,
+                profile.SourceConnection.EffectiveConnectionString,
                 pgSourceLogger,
                 profile.Options.CommandTimeoutSeconds);
         }
@@ -105,28 +105,28 @@ public class SyncOrchestrator
         if (_targetDatabaseType == DatabaseType.PostgreSql)
         {
             _targetAnalyzer = new PostgreSqlSchemaAnalyzer(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 pgSourceLogger,
                 profile.Options.CommandTimeoutSeconds);
 
             if (profile.Options.EnableSyncHistory)
             {
                 _historyRepository = new PostgreSqlSyncHistoryRepository(
-                    profile.TargetConnection.ConnectionString,
+                    profile.TargetConnection.EffectiveConnectionString,
                     pgHistoryLogger);
             }
         }
         else if (_targetDatabaseType == DatabaseType.SqlServer)
         {
             _targetAnalyzer = new SqlServerTargetAnalyzer(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 sqlTargetLogger,
                 profile.Options.CommandTimeoutSeconds);
 
             if (profile.Options.EnableSyncHistory)
             {
                 _historyRepository = new SqlServerSyncHistoryRepository(
-                    profile.TargetConnection.ConnectionString,
+                    profile.TargetConnection.EffectiveConnectionString,
                     sqlHistoryLogger);
             }
         }
@@ -140,8 +140,8 @@ public class SyncOrchestrator
         {
             case (DatabaseType.SqlServer, DatabaseType.PostgreSql):
                 _sqlServerToPostgreSqlCopier = new BulkDataCopier(
-                    profile.SourceConnection.ConnectionString,
-                    profile.TargetConnection.ConnectionString,
+                    profile.SourceConnection.EffectiveConnectionString,
+                    profile.TargetConnection.EffectiveConnectionString,
                     _typeMapper,
                     sqlToPgCopierLogger,
                     profile.Options.CommandTimeoutSeconds)
@@ -153,8 +153,8 @@ public class SyncOrchestrator
 
             case (DatabaseType.SqlServer, DatabaseType.SqlServer):
                 _sqlServerToSqlServerCopier = new SqlServerBulkDataCopier(
-                    profile.SourceConnection.ConnectionString,
-                    profile.TargetConnection.ConnectionString,
+                    profile.SourceConnection.EffectiveConnectionString,
+                    profile.TargetConnection.EffectiveConnectionString,
                     sqlToSqlCopierLogger,
                     profile.Options.CommandTimeoutSeconds)
                 {
@@ -165,8 +165,8 @@ public class SyncOrchestrator
 
             case (DatabaseType.PostgreSql, DatabaseType.PostgreSql):
                 _postgreSqlToPostgreSqlCopier = new PostgreSqlBulkDataCopier(
-                    profile.SourceConnection.ConnectionString,
-                    profile.TargetConnection.ConnectionString,
+                    profile.SourceConnection.EffectiveConnectionString,
+                    profile.TargetConnection.EffectiveConnectionString,
                     pgToPgCopierLogger,
                     profile.Options.CommandTimeoutSeconds)
                 {
@@ -178,8 +178,8 @@ public class SyncOrchestrator
 
             case (DatabaseType.PostgreSql, DatabaseType.SqlServer):
                 _postgreSqlToSqlServerCopier = new PostgreSqlToSqlServerBulkCopier(
-                    profile.SourceConnection.ConnectionString,
-                    profile.TargetConnection.ConnectionString,
+                    profile.SourceConnection.EffectiveConnectionString,
+                    profile.TargetConnection.EffectiveConnectionString,
                     pgToSqlCopierLogger,
                     profile.Options.CommandTimeoutSeconds)
                 {
@@ -570,7 +570,7 @@ public class SyncOrchestrator
                          loadThrottling.CheckTiming == LoadCheckTiming.Both))
                     {
                         await loadMonitor.WaitForLowLoadAsync(
-                            _profile.SourceConnection.ConnectionString,
+                            _profile.SourceConnection.EffectiveConnectionString,
                             _sourceDatabaseType,
                             loadThrottling.MaxCpuPercent,
                             loadThrottling.CheckIntervalSeconds,
@@ -618,7 +618,7 @@ public class SyncOrchestrator
                                  throttling.CheckTiming == LoadCheckTiming.Both))
                             {
                                 await monitor.WaitForLowLoadAsync(
-                                    _profile.SourceConnection.ConnectionString,
+                                    _profile.SourceConnection.EffectiveConnectionString,
                                     _sourceDatabaseType,
                                     throttling.MaxCpuPercent,
                                     throttling.CheckIntervalSeconds,
@@ -874,7 +874,7 @@ CREATE TABLE ""{tableName}"" (
 {string.Join(",\n", columnDefs)}{pkConstraint}
 )";
 
-        await using var connection = new NpgsqlConnection(_profile.TargetConnection.ConnectionString);
+        await using var connection = new NpgsqlConnection(_profile.TargetConnection.EffectiveConnectionString);
         await connection.ExecuteAsync(sql, commandTimeout: _profile.Options.CommandTimeoutSeconds);
     }
 
@@ -899,7 +899,7 @@ CREATE TABLE [{tableName}] (
 {string.Join(",\n", columnDefs)}{pkConstraint}
 )";
 
-        await using var connection = new SqlConnection(_profile.TargetConnection.ConnectionString);
+        await using var connection = new SqlConnection(_profile.TargetConnection.EffectiveConnectionString);
         await connection.ExecuteAsync(sql, commandTimeout: _profile.Options.CommandTimeoutSeconds);
     }
 

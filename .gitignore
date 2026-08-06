@@ -49,6 +49,12 @@ profiles/
 profiles.Development/
 profiles.Production/
 
+# Secrets files supplying ${PLACEHOLDER} values for profile connection strings.
+# The tracked template is secrets.env.example (no real values).
+secrets.env
+secrets.*.env
+*.secrets.env
+
 # Publish output
 publish/
 out/

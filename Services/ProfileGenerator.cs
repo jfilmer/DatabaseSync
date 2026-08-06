@@ -181,7 +181,7 @@ public class ProfileGenerator
 
         if (connection.DatabaseType == DatabaseType.PostgreSql)
         {
-            await using var conn = new NpgsqlConnection(connection.ConnectionString);
+            await using var conn = new NpgsqlConnection(connection.EffectiveConnectionString);
             await conn.OpenAsync();
 
             var query = @"
@@ -209,7 +209,7 @@ public class ProfileGenerator
         }
         else if (connection.DatabaseType == DatabaseType.SqlServer)
         {
-            await using var conn = new SqlConnection(connection.ConnectionString);
+            await using var conn = new SqlConnection(connection.EffectiveConnectionString);
             await conn.OpenAsync();
 
             var query = @"
@@ -249,7 +249,7 @@ public class ProfileGenerator
 
         if (connection.DatabaseType == DatabaseType.PostgreSql)
         {
-            await using var conn = new NpgsqlConnection(connection.ConnectionString);
+            await using var conn = new NpgsqlConnection(connection.EffectiveConnectionString);
             await conn.OpenAsync();
 
             // Use pg_constraint directly for reliable FK detection
@@ -273,7 +273,7 @@ public class ProfileGenerator
         }
         else if (connection.DatabaseType == DatabaseType.SqlServer)
         {
-            await using var conn = new SqlConnection(connection.ConnectionString);
+            await using var conn = new SqlConnection(connection.EffectiveConnectionString);
             await conn.OpenAsync();
 
             var query = @"

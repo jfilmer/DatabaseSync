@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using DatabaseSync.Enums;
 
 namespace DatabaseSync.Configuration;
@@ -64,6 +65,20 @@ public class SyncServiceConfig
     /// Supports environment-specific directories: profiles.{Environment}/
     /// </summary>
     public string ProfilesDirectory { get; set; } = "profiles";
+
+    /// <summary>
+    /// File supplying values for ${PLACEHOLDER} tokens in profile connection strings.
+    /// Relative paths resolve against the application directory. Format is NAME=value, one per
+    /// line, '#' comments allowed, optional "export " prefix.
+    ///
+    /// On Unix the file MUST have no group or other permission bits (chmod 600) or the service
+    /// refuses to start. A missing file is not an error - environment variables alone are a
+    /// valid configuration, and are preferred where the host supports them
+    /// (systemd EnvironmentFile= on ubu2, service environment on win2).
+    ///
+    /// Set to "" to disable file-based secrets entirely.
+    /// </summary>
+    public string SecretsFile { get; set; } = "secrets.env";
 
     /// <summary>
     /// Startup delay in seconds before RunImmediatelyOnStart syncs begin.
@@ -277,12 +292,46 @@ public class ConnectionConfig
     /// Database type: SqlServer or PostgreSql
     /// </summary>
     public string Type { get; set; } = "SqlServer";
-    
+
     /// <summary>
-    /// Connection string for the database
+    /// Connection string as written in the profile file. May contain ${PLACEHOLDER} tokens
+    /// resolved at load time by <see cref="Services.SecretResolver"/>.
+    ///
+    /// This is the ONLY connection value that is ever serialized back to disk. Anything that
+    /// needs to actually open a connection must use <see cref="EffectiveConnectionString"/>.
+    /// Keeping the template here is what stops ProfileGenerator writing resolved passwords into
+    /// profiles/_generated/*.json (AIM #1821).
     /// </summary>
     public string ConnectionString { get; set; } = string.Empty;
-    
+
+    /// <summary>
+    /// Optional AIM config id for the credential this connection uses, e.g. "config#57".
+    /// Documentation and audit only - it is never read at runtime, so the service has no
+    /// startup dependency on AIM. Satisfies rule #115's "AIM is the system of record" without
+    /// coupling the sync to AIM being reachable.
+    /// </summary>
+    public string? SecretRef { get; set; }
+
+    /// <summary>
+    /// Connection string with placeholders substituted. Populated by ProfileLoader.
+    /// [JsonIgnore] is load-bearing: it makes it structurally impossible to serialize a
+    /// resolved secret, no matter what future code serializes a profile.
+    /// </summary>
+    [JsonIgnore]
+    public string? ResolvedConnectionString { get; private set; }
+
+    /// <summary>
+    /// The value to connect with. Falls back to the raw string when no resolution has run,
+    /// so profiles that contain no placeholders keep working unchanged.
+    /// </summary>
+    [JsonIgnore]
+    public string EffectiveConnectionString => ResolvedConnectionString ?? ConnectionString;
+
+    /// <summary>
+    /// Called by ProfileLoader after placeholder substitution.
+    /// </summary>
+    public void SetResolvedConnectionString(string value) => ResolvedConnectionString = value;
+
     /// <summary>
     /// Parsed database type enum
     /// </summary>

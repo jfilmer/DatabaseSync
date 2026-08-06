@@ -192,8 +192,26 @@ public static class ConfigurationValidator
 
     private static void ValidateConnectionString(ConnectionConfig connection, string prefix, ConfigurationValidationResult result)
     {
-        var connStr = connection.ConnectionString;
+        // Validate what will actually be used to connect, not the on-disk template.
+        var connStr = connection.EffectiveConnectionString;
         var dbType = connection.DatabaseType;
+
+        // A leftover ${NAME} means SecretResolver found no value in the environment or the
+        // secrets file. Fail here rather than letting the literal token be sent as a password
+        // and surface later as an opaque auth failure (AIM #1821).
+        var unresolved = System.Text.RegularExpressions.Regex
+            .Matches(connStr, @"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+            .Select(m => m.Groups[1].Value)
+            .Distinct()
+            .ToList();
+
+        if (unresolved.Count > 0)
+        {
+            result.Errors.Add(
+                $"{prefix}: unresolved secret placeholder(s) {string.Join(", ", unresolved.Select(n => "${" + n + "}"))}. " +
+                "Set them as environment variables or add them to the secrets file (SyncService:SecretsFile).");
+            return;
+        }
 
         // Determine database type from connection string if Type not specified
         var isSqlServer = dbType == Enums.DatabaseType.SqlServer ||

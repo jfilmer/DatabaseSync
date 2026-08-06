@@ -56,8 +56,87 @@ public static class ProfileLoader
         // Deduplicate profiles (last-loaded wins)
         var deduplicated = DeduplicateProfiles(allProfiles, logger);
 
+        // Substitute ${PLACEHOLDER} tokens in connection strings from environment / secrets file.
+        // Runs AFTER dedup (so only surviving profiles are resolved) and BEFORE validation in
+        // Program.cs, so an unresolved placeholder surfaces as a validation error rather than a
+        // connection attempt with a literal "${NAME}" as the password.
+        ResolveSecrets(deduplicated, baseConfig, basePath, logger);
+
         logger.Information("Total profiles loaded: {Count}", deduplicated.Count);
         return deduplicated;
+    }
+
+    /// <summary>
+    /// Resolves connection-string placeholders for every profile. The raw template stays on
+    /// ConnectionString; the resolved value goes to ResolvedConnectionString, which is
+    /// [JsonIgnore] and therefore can never be written back to disk.
+    /// </summary>
+    private static void ResolveSecrets(
+        List<SyncProfile> profiles,
+        SyncServiceConfig baseConfig,
+        string basePath,
+        SerilogLogger logger)
+    {
+        var resolver = SecretResolver.Create(baseConfig.SecretsFile, basePath, logger);
+        var profilesWithPlaceholders = 0;
+
+        foreach (var profile in profiles)
+        {
+            var hadPlaceholder = false;
+
+            foreach (var (connection, role) in new[]
+                     {
+                         (profile.SourceConnection, "SourceConnection"),
+                         (profile.TargetConnection, "TargetConnection")
+                     })
+            {
+                if (connection == null)
+                {
+                    continue;
+                }
+
+                var template = connection.ConnectionString;
+                hadPlaceholder |= template.Contains("${", StringComparison.Ordinal);
+
+                connection.SetResolvedConnectionString(
+                    resolver.Resolve(template, $"{profile.ProfileName}.{role}"));
+            }
+
+            if (hadPlaceholder)
+            {
+                profilesWithPlaceholders++;
+            }
+        }
+
+        if (resolver.UnresolvedNames.Count > 0)
+        {
+            // Names only - never the values.
+            var names = string.Join(", ", resolver.UnresolvedNames.OrderBy(n => n));
+            logger.Fatal(
+                "{Count} secret placeholder(s) could not be resolved: {Names}",
+                resolver.UnresolvedNames.Count, names);
+
+            // DELIBERATELY FATAL, and it takes the whole service down rather than just the
+            // affected profile. ConfigurationValidator only LOGS errors - startup continues
+            // (Program.cs) - so without this the service would stay "active" while connecting
+            // with the literal text "${NAME}" as the password. That is precisely the shape of
+            // the nine-day silent outage after the 2026-07-16 empdev rotation: profiles failing
+            // nightly while `systemctl is-active` still reported healthy.
+            //
+            // Trade-off accepted: one bad placeholder stops the other profiles too. Chosen
+            // because the deployed config is hand-copied (no deploy script), so a half-resolved
+            // config is an operator error that must be fixed now, and because systemd's
+            // StartLimitBurst then halts the unit visibly instead of letting it limp. AIM #1821.
+            throw new InvalidOperationException(
+                $"Unresolved secret placeholder(s): {names}. " +
+                "Set them as environment variables or add them to the secrets file " +
+                "(SyncService:SecretsFile). Refusing to start with unresolved credentials.");
+        }
+
+        logger.Information(
+            "Secret resolution complete: {WithPlaceholders} of {Total} profile(s) use placeholders, " +
+            "{Unresolved} unresolved",
+            profilesWithPlaceholders, profiles.Count, resolver.UnresolvedNames.Count);
     }
 
     /// <summary>
