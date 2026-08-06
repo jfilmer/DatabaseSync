@@ -399,13 +399,13 @@ try
         if (profile.TargetConnection.DatabaseType == DatabaseSync.Enums.DatabaseType.PostgreSql)
         {
             historyRepo = new DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository>());
         }
         else
         {
             historyRepo = new DatabaseSync.SqlServer.SqlServerSyncHistoryRepository(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.SqlServer.SqlServerSyncHistoryRepository>());
         }
 
@@ -416,7 +416,7 @@ try
 
         return Results.Ok(new
         {
-            Database = profile.TargetConnection.ConnectionString.Split(';')
+            Database = profile.TargetConnection.EffectiveConnectionString.Split(';')
                 .FirstOrDefault(p => p.StartsWith("Database=", StringComparison.OrdinalIgnoreCase) ||
                                      p.StartsWith("Initial Catalog=", StringComparison.OrdinalIgnoreCase)),
             ConfiguredProfiles = configProfiles.ToList(),
@@ -443,13 +443,13 @@ try
         if (profile.TargetConnection.DatabaseType == DatabaseSync.Enums.DatabaseType.PostgreSql)
         {
             historyRepo = new DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.PostgreSql.PostgreSqlSyncHistoryRepository>());
         }
         else
         {
             historyRepo = new DatabaseSync.SqlServer.SqlServerSyncHistoryRepository(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<DatabaseSync.SqlServer.SqlServerSyncHistoryRepository>());
         }
 

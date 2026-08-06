@@ -33,8 +33,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- CopyToPublishDirectory=Never is a SECURITY control, not tidiness (AIM #1821).
+         Copying profiles into publish output is what scattered 219 plaintext-credential
+         copies across bin/ and publish/ at mode 777, including a live production role that
+         was readable and writable by github-runner via the devshare mirror.
+         Profiles are managed per-host anyway: the documented deploys rsync/scp them
+         separately and explicitly EXCLUDE profiles/ from the build output. -->
     <Content Update="profiles\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Never</CopyToPublishDirectory>
     </Content>
     <Content Update="profiles.Development\**\*.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>

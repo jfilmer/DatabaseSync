@@ -232,7 +232,7 @@ public class ProfileScheduler : BackgroundService
              throttling.CheckTiming == LoadCheckTiming.Both))
         {
             await _loadMonitor.WaitForLowLoadAsync(
-                profile.SourceConnection.ConnectionString,
+                profile.SourceConnection.EffectiveConnectionString,
                 profile.SourceConnection.DatabaseType,
                 throttling.MaxCpuPercent,
                 throttling.CheckIntervalSeconds,
@@ -527,7 +527,7 @@ public class ProfileScheduler : BackgroundService
         var profile = _config.Profiles.FirstOrDefault(p =>
             p.ProfileName.Equals(profileName, StringComparison.OrdinalIgnoreCase));
 
-        if (profile == null || string.IsNullOrEmpty(profile.TargetConnection?.ConnectionString))
+        if (profile == null || string.IsNullOrEmpty(profile.TargetConnection?.EffectiveConnectionString))
         {
             return new List<SyncHistory>();
         }
@@ -537,13 +537,13 @@ public class ProfileScheduler : BackgroundService
         if (profile.TargetConnection.DatabaseType == Enums.DatabaseType.PostgreSql)
         {
             historyRepo = new PostgreSqlSyncHistoryRepository(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 _loggerFactory.CreateLogger<PostgreSqlSyncHistoryRepository>());
         }
         else
         {
             historyRepo = new SqlServerSyncHistoryRepository(
-                profile.TargetConnection.ConnectionString,
+                profile.TargetConnection.EffectiveConnectionString,
                 _loggerFactory.CreateLogger<SqlServerSyncHistoryRepository>());
         }
 
