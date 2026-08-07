@@ -1174,6 +1174,33 @@ startup dependency on AIM being reachable.
 | win2 | `C:\Services\DatabaseSync\secrets.env` | 3 LMPro SQL Server |
 | workstation | `DatabaseSync/secrets.env` — 600, gitignored, **excluded from the devshare mirror** | all 9 |
 
+**Placeholder → AIM config (rule #115 system of record).** Every connection also carries a
+matching `SecretRef`; retrieve a value with `aim_get_config` + `reveal`.
+
+| Placeholder | AIM config | Host / login | Profiles |
+|---|---|---|---|
+| `DBSYNC_EMPPROD_PASSWORD` | #7 | `empprod@prodpgsql` | 07,08,09,10,13 (source) |
+| `DBSYNC_EMPDEV_PASSWORD` | #6 | `empdev@devpgsql` | 07,08,09,10,13 (target) |
+| `DBSYNC_ACXPROD_PASSWORD` | #265 | `acxprod@prodpgsql` | 11 (source) |
+| `DBSYNC_ACXDEV_PASSWORD` | #264 | `acxdev@devpgsql` | 11 (target) |
+| `DBSYNC_RMPPROD_PASSWORD` | #65 | `rmpprod@prodpgsql` | 12 (source) |
+| `DBSYNC_RMPDEV_PASSWORD` | #64 | `rmpdev@devpgsql` | 12 (target) |
+| `DBSYNC_LMP_PRDSQL_PASSWORD` | **#272** | `jfilmer@prdsql.lmpro.us` (AWS RDS, prod) | 01,03,05 (source) |
+| `DBSYNC_LMP_STGSQL_PASSWORD` | **#273** | `jfilmer@stgsql.lmpro.us` (AWS EC2, staging) | 01,03,05 target + 02,04,06 source |
+| `DBSYNC_LMP_NOLA1SQL_PASSWORD` | **#274** | `jfilmer@10.10.2.10` = **win2** / `devmssql.digsol.us` | 02,04,06 (target) |
+
+⚠ **"nola1sql" is a legacy filename, not a host.** Profiles 02/04/06 are named `*-nola1sql.json`
+but the connection string points at `10.10.2.10`, which is **win2** (server_id 5) — so the service
+runs on win2 and syncs into win2's own SQL Server. The env-var name keeps the legacy spelling to
+match the filenames; the AIM config is keyed `mssql.lmpro.devmssql.password` by what it actually
+is. Do not create a second "nola1sql" config.
+
+⚠ Configs **#272/#273/#274 were created with NO VALUE** (2026-08-07) and must be filled in from the
+AIM UI, not from a Claude Code session — `aim_create_config`/`aim_update_config` take the value as
+a tool parameter, which would write a live credential into a session transcript (the AIM #1824
+failure mode). The three LMPro logins are also personal-looking `jfilmer` accounts rather than
+service roles, and were never part of the DSG PostgreSQL rotation work.
+
 **Two failure modes are deliberately FATAL — the service refuses to start:**
 
 1. **An unresolved placeholder.** `ConfigurationValidator` only *logs* errors; startup continues
