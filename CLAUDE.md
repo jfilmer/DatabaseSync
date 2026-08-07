@@ -140,7 +140,11 @@ ssh claude@win2.digsol.us "sc stop DatabaseSync"
 # 3. Copy published files to win2 (flat files only, excludes profiles/ directory)
 scp /tmp/DatabaseSync-publish/*.* claude@win2.digsol.us:"C:/Services/DatabaseSync/"
 
-# 4. Copy profile configs (SQL Server profiles only, 1-6)
+# 4. Copy profile configs (SQL Server profiles only, 01-06)
+#    These carry ${PLACEHOLDER}s, not passwords. win2 resolves them from
+#    C:\Services\DatabaseSync\secrets.env, which holds the 3 DBSYNC_LMP_* keys and is
+#    NEVER overwritten by a deploy. If that file is missing the service will refuse to
+#    start (fatal by design) rather than run with unresolved credentials.
 scp profiles/0[1-6]*.json claude@win2.digsol.us:"C:/Services/DatabaseSync/profiles/"
 
 # 5. Start the service
@@ -166,29 +170,50 @@ ssh claude@win2.digsol.us "powershell -command \"Select-String -Path 'D:\Logs\Da
 
 ### Remote Deployment via SSH (ubu2)
 
+> ✅ **Use `./scripts/deploy-ubu2.sh`.** It does everything below *plus* enforces `600 root:root`
+> on `profiles/` and `secrets.env`, proves `github-runner` is denied, and runs the credential
+> canary. The manual steps are kept for reference and for debugging the script.
+>
+> 🔴 Two corrections to the older manual steps below, both of which caused real exposure:
+> - The build must NOT run on the workstation (rule #123) — it runs on ubu2.
+> - `--exclude 'profiles/'` is **unanchored** and matches that directory name at any depth, so
+>   `--delete` skips nested copies. Use `--exclude '/profiles/'`. An unanchored pattern is how 36
+>   credential files survived in `/opt/services/DatabaseSync/publish/`.
+> - `chown -R www-data` is **wrong** for profiles. The unit declares no `User=`, so the service
+>   runs as root; profiles must be `600 root:root` (server_event #207).
+
 ```bash
-# 1. Publish from the project directory (runs on local Linux machine)
-dotnet publish DatabaseSync.csproj -c Release -r linux-x64 --self-contained true -o /tmp/DatabaseSync-publish-linux
+# 1. Build ON UBU2 (rule #123 - never on the workstation or the NFS mount)
+~/sync-devlocal.sh          # mirror is hourly; sync so ubu2 builds current source
+ssh claude@ubu2.digsol.us 'rm -rf /tmp/dbsync && \
+  rsync -a --exclude=bin --exclude=obj --exclude="._*" --exclude="profiles/" --exclude="secrets.env" \
+        /mnt/devshare/ClaudeProjects/DatabaseSync/ /tmp/dbsync/ && \
+  cd /tmp/dbsync && dotnet publish DatabaseSync.csproj -c Release -o /tmp/dbsync/out --nologo'
 
-# 2. Stop the service
-ssh claude@ubu2.digsol.us "sudo systemctl stop database-sync"
+# 2. Stop, deploy binaries (ANCHORED excludes), start
+ssh claude@ubu2.digsol.us "sudo systemctl stop database-sync && \
+  sudo rsync -a --delete --exclude='/profiles/' --exclude='/secrets.env' \
+       --exclude='/.database-sync.lock' /tmp/dbsync/out/ /opt/services/DatabaseSync/"
 
-# 3. Copy published files to ubu2 staging directory
-scp -r /tmp/DatabaseSync-publish-linux/* claude@ubu2.digsol.us:/tmp/DatabaseSync-deploy/
+# 3. Re-assert modes - a copy at the default umask silently re-widens them
+ssh claude@ubu2.digsol.us "sudo chown -R root:root /opt/services/DatabaseSync/profiles && \
+  sudo chmod 750 /opt/services/DatabaseSync/profiles && \
+  sudo find /opt/services/DatabaseSync/profiles -type f -exec chmod 600 {} + && \
+  sudo chmod 600 /opt/services/DatabaseSync/secrets.env"
 
-# 4. Deploy binaries (exclude profiles/ to preserve existing configs on server)
-ssh claude@ubu2.digsol.us "sudo rsync -a --exclude 'profiles/' /tmp/DatabaseSync-deploy/ /opt/services/DatabaseSync/ && sudo chown -R www-data:www-data /opt/services/DatabaseSync/"
+# 4. Profiles only when changed (PG profiles only, 07-13). They carry ${PLACEHOLDER}s,
+#    not passwords - the values live in secrets.env, which is NEVER copied from the workstation.
+scp profiles/0[7-9]*.json profiles/1[0-3]*.json claude@ubu2.digsol.us:/tmp/
+ssh claude@ubu2.digsol.us "sudo cp /tmp/*.json /opt/services/DatabaseSync/profiles/ && \
+  sudo chown root:root /opt/services/DatabaseSync/profiles/*.json && \
+  sudo chmod 600 /opt/services/DatabaseSync/profiles/*.json && rm -f /tmp/*.json"
 
-# 5. Update profiles only when changed (PG profiles only, 7-10)
-scp profiles/0[7-9]*.json profiles/1[0-3]*.json claude@ubu2.digsol.us:/tmp/DatabaseSync-deploy/
-ssh claude@ubu2.digsol.us "sudo cp /tmp/DatabaseSync-deploy/*.json /opt/services/DatabaseSync/profiles/ && sudo chown www-data:www-data /opt/services/DatabaseSync/profiles/*.json"
-
-# 6. Start the service
+# 5. Start and verify
 ssh claude@ubu2.digsol.us "sudo systemctl start database-sync"
-
-# 7. Verify
 ssh claude@ubu2.digsol.us "sudo systemctl is-active database-sync"
 ssh claude@ubu2.digsol.us "curl -s http://localhost:5123/health"
+# Confirm resolution fired - "N of N profile(s) use placeholders, 0 unresolved"
+ssh claude@ubu2.digsol.us "journalctl -u database-sync --since '-2min' -q | grep 'Secret resolution'"
 ```
 
 **Note**: The `rsync --exclude 'profiles/'` pattern prevents the build output's profiles directory (which may contain SQL Server profiles from the source tree) from overwriting the server's PG-only profiles. Always update profiles separately in step 5.
@@ -1125,15 +1150,126 @@ The `IN (...)` list grandfathers fixtures created before the convention; prefer 
 
 **The filter protects against deletion, not against a PK collision.** A dev-only row that takes an ID the source later assigns to a different row is overwritten by the upsert, which keys on the PK. Sequence resets after each sync make this unlikely, not impossible.
 
+## Credentials: profiles carry `${PLACEHOLDER}`, never a password (AIM #1821)
+
+Since 2026-08-06 **no profile file contains a password.** Each connection string carries a
+placeholder that `SecretResolver` substitutes at load time:
+
+```json
+"SourceConnection": {
+  "Type": "PostgreSql",
+  "ConnectionString": "Host=prodpgsql.digsol.us;Port=8282;Database=emp;Username=empprod;Password=${DBSYNC_EMPPROD_PASSWORD}",
+  "SecretRef": "aim:config/7"
+}
+```
+
+**Resolution order per `${NAME}`** (first hit wins): process environment variable → the secrets
+file. `$${NAME}` escapes to a literal `${NAME}`; a password that genuinely contains `${` must use
+that form. `SecretRef` is documentation only — never read at runtime, so the service has no
+startup dependency on AIM being reachable.
+
+| Host | Secrets file | Keys |
+|---|---|---|
+| ubu2 | `/opt/services/DatabaseSync/secrets.env` — **600 root:root** | 6 PostgreSQL |
+| win2 | `C:\Services\DatabaseSync\secrets.env` | 3 LMPro SQL Server |
+| workstation | `DatabaseSync/secrets.env` — 600, gitignored, **excluded from the devshare mirror** | all 9 |
+
+**Two failure modes are deliberately FATAL — the service refuses to start:**
+
+1. **An unresolved placeholder.** `ConfigurationValidator` only *logs* errors; startup continues
+   (`Program.cs`). Without the hard failure the service would sit `active` while connecting with
+   the literal text `${NAME}` as the password — the exact shape of the nine-day outage below.
+   One bad placeholder stops *every* profile; that trade-off is deliberate.
+2. **A secrets file with any group/other permission bit** (Unix only; on Windows ACLs govern and
+   the check is skipped). This is what stops a hand-copy at the default umask silently re-widening
+   the file, since `/opt/services/DatabaseSync` has no automatic deploy.
+
+**`ConnectionString` vs `EffectiveConnectionString` — get this right or you leak.** The model
+splits them on purpose:
+
+- `ConnectionString` — the on-disk template. **The only value ever serialized.**
+- `ResolvedConnectionString` — `[JsonIgnore]`, so it is structurally impossible to write to disk.
+- `EffectiveConnectionString` — what every consumer connects with.
+
+Anything that opens a connection must use `EffectiveConnectionString`. Anything that *writes a
+profile* must use `ConnectionString`. That split is why `ProfileGenerator` is safe for free: it
+copies the `ConnectionConfig` verbatim into `profiles/_generated/*.json`, so it emits placeholders
+rather than resolved passwords.
+
+**Rotating a password is now a one-file edit** — change the value in each host's `secrets.env` and
+restart. No profile file changes. `grep`-ing profiles for an old value no longer finds anything,
+because the value is not there.
+
 ### Gotcha: `profiles/` is gitignored, so password rotations never reach it
 
-Profile files hold plaintext connection strings and are in `.gitignore`, so they are only ever updated by hand-copying to `/opt/services/DatabaseSync/profiles/` on ubu2 — nothing links them to the credential's system-of-record in AIM.
+*(Largely retired by the placeholder mechanism above — a rotation now touches `secrets.env`, not
+13 profile files. Kept because the detection lessons still apply.)*
+
+Profile files are in `.gitignore`, so they are only ever updated by hand-copying to
+`/opt/services/DatabaseSync/profiles/` on ubu2.
 
 **Nine-day outage, 2026-07-16 → 07-25.** `empdev` was rotated 2026-07-16 (AIM #1517, after the value leaked in whats-going-on git history). DatabaseSync's four `emp` profiles were not updated, so **7-CORE / 8-EMP / 9-NXS / 10-WGO failed nightly with `28P01 password authentication failed`** while ACX/RMP (different credentials) kept succeeding.
 
 - **`systemctl is-active` is not a health check here.** A failing profile does not stop the host process — the service reported `active` throughout. Check `_sync_history` freshness per profile, or `/status`.
 - **`journalctl` retention hid the age** (only went back to the last boot, four days), making a nine-day failure look recent. `_sync_history` is what dated it to the rotation.
-- **When rotating any DB password, grep the profiles for the old value** — locally *and* under `/opt/services/DatabaseSync/profiles/` on ubu2. Current values: `aim_get_config` with `reveal`.
+- **When rotating any DB password**, update each host's `secrets.env` and restart. Current values: `aim_get_config` with `reveal`.
+
+### 🔴 Auditing this repo for stray credentials — the recursive grep LIES
+
+`grep -rl "Password=" .` reports **zero** credential files in this repo, and that is not because
+there are none. Claude Code's Bash `grep` is a shell function wrapping **ugrep with
+`--ignore-files`**, i.e. gitignore-aware — and `profiles/`, `publish/`, `bin/` and `secrets.env`
+are all gitignored. Measured 2026-08-06: gitignore-aware grep found **4** files (all `.md`
+examples); `find … -print0 | xargs -0 grep -l` found **237**.
+
+```bash
+# The only trustworthy form:
+find . -path ./.git -prune -o -type f -print0 | xargs -0 grep -l "Password=" 2>/dev/null
+# Classify, digit-safe (placeholder names contain digits, e.g. LMP_NOLA1SQL):
+grep -ohE 'Password=[^;"]*' profiles/*.json \
+  | sed -E 's/Password=\$\{[A-Za-z0-9_]+\}/PLACEHOLDER/; t; s/Password=.*/LITERAL/' | sort | uniq -c
+```
+
+**Five copies existed, and each prior audit found only the ones it thought to look for:**
+
+| Location | Files | Mode | Reached by |
+|---|---|---|---|
+| `profiles/` (devlocal + mirror) | 13 | 600 | owner only |
+| `publish/` (devlocal + mirror) | 24 | **777** | `github-runner` **read+write** |
+| `bin/` (devlocal only) | 195 | 777 | mirror-excluded |
+| `devdocs/DatabaseSyncConfigSummary.txt` | 1 | 664 | mirrored, world-readable |
+| `/opt/services/DatabaseSync/publish/` | 36 | 775 | `github-runner` read |
+
+All deleted 2026-08-06 (workstation_event #38, server_event #215). Two mechanisms created them and
+both are now closed:
+
+- **The csproj copied profiles into build output.** `<Content Update="profiles\**\*.json">` now
+  carries `<CopyToPublishDirectory>Never</CopyToPublishDirectory>`. Verified: a `win-x64` publish
+  emits **0** profile files.
+- **`deploy-ubu2.sh`'s excludes were unanchored.** `--exclude='profiles/'` matches a directory of
+  that name at *any* depth, so `--delete` skipped `publish/profiles/` and left it forever. The
+  patterns are now anchored (`--exclude='/profiles/'`), and the script runs a **credential canary**
+  that fails the deploy if any file outside `profiles/` contains `Password=`.
+
+### Deploying: use `scripts/deploy-ubu2.sh`
+
+The ubu2 deploy was hand-copied with no script on-host or in-repo — which is how the deployed
+profiles ended up world-readable with three production credentials (server_event #207). The script
+builds on ubu2 (rule #123), deploys binaries only, then **enforces `600 root:root` on
+`profiles/` + `secrets.env`, proves `github-runner` is denied, and runs the credential canary.**
+
+```bash
+./scripts/deploy-ubu2.sh            # build + deploy + enforce + verify
+./scripts/deploy-ubu2.sh --modes    # enforce modes only
+```
+
+**Profiles are never deployed by it** — they are per-host config (win2 has 01-06, ubu2 has 07-13)
+and shipping the build's copy would overwrite the live set.
+
+⚠ **`sudo` + globs**: the deployed `profiles/` dir is 750 root:root, so a glob written *outside*
+`sudo` expands as the calling user and silently yields nothing — `sudo stat "$D"/*.json` returns
+"No such file or directory" while the files are plainly there. Put the glob inside
+`sudo bash -c '…'`. Hit twice now (server_event #207 and again #215); same shape as AIM #1507.
 
 ---
 
@@ -1686,4 +1822,4 @@ public async Task<SyncResult> SyncTableAsync(...)
 - **Stack**: C# / .NET 8, SQL Server, PostgreSQL
 - **Architecture**: Multi-profile, timer-based scheduler with HTTP API
 
-*Last Updated (2026-07-25): **Added profile 13-FAF-prodpgsql-devpgsql** — the `faf` schema finally has a mirror (29 tables, runs LAST because all 29 have cross-schema FKs into core). Deliberately `DeleteMode: None` on every table: dev holds ~285 dev-only FAF test rows that full parity would destroy. The trade-off is PK collisions instead — the first run already overwrote 4 dev rows (3 carts, 1 refund) because dev's IDs sit inside the range prod hasn't reached. No config avoids both losses; needs a deliberate reconciliation. FK graph contains a real CYCLE (tickets → order_items → resale_listings → tickets), broken at the two nullable edges. Prior: **Profile prefixes are now ZERO-PADDED (01-12)** — both sort sites compare strings, so `"10" < "7"` meant CORE was running FOURTH, after WGO, inverting the documented cross-schema FK order ever since WGO became profile 10. Masked all along by DisableTriggersDuringLoad suppressing the FKs that would have made it loud. Every renamed profile pins `ProfileId` to its old name so `_sync_history` stays continuous (verified: CORE still resolves 5,849 rows back to 2026-03-03, win2's 01-LMP_Main still returns its runs). **Profile drift audited against prod**: 9 missing tables added (5 core, 2 emp, 1 nxs), 3 stale `wgo.curator_*` entries removed — they had MOVED to the core schema, not vanished — and `wgo.trending_chip_counts` rejected because it has no PK (the upsert requires one). **ACX sequence grants fixed**: acxdev had UPDATE on 0 of 8 `media.*` sequences since #1281, so every run logged 42501 and skipped the setval; also learned `ALTER DEFAULT PRIVILEGES FOR ROLE claude` does NOT cover `postgres`-owned objects. **RI audit's first real catch**: 140 orphaned RMP token rows under deleted users — structural, since token tables are Rule-#132-excluded while their parent users table is mirrored; cleaned. Prior in this pass: Closed the blast-radius gap that `DisableTriggersDuringLoad` opened — suppressing RI on the target also unguards the ordinary parity-delete, which silently orphaned `faf` rows (the one schema with no sync profile: 35 FKs into `core`) and destroyed every dev-only test account in mirrored `core.*` tables. Three additions: `AuditReferentialIntegrityAfterSync` (post-run orphan count over `pg_constraint`, flags child tables outside sync scope), `DeleteExclusionFilter` (target-side WHERE exempting dev fixtures from parity deletes; convention is a `+devfixture@` email), and `MaxDeletePercent` (ratio ceiling — the PG delete path previously had NO safety check, unlike the SQL Server path). Deliberately did NOT narrow the `session_replication_role` scope: it is load-bearing on the delete path for `core.events`' self-FK. All three proven with controlled probes, not just observed green. Enabled on all 6 PG mirror profiles. Also fixed a nine-day silent outage: `empdev` was rotated 2026-07-16 (AIM #1517) and the gitignored profile files were never updated, so 7-CORE/8-EMP/9-NXS/10-WGO had failed nightly with 28P01 while `systemctl is-active` still reported healthy. Prior: Added profile 12-RMP-prodpgsql-devpgsql (rmp database, rmp schema, 39 tables, prod→dev mirror, daily 05:00, DisableTriggersDuringLoad) — RMP is now on ubu1 so the long-standing TODO is done. First PostGIS sync: `geography` columns round-trip via the USER-DEFINED `::text` cast (md5-identical), generated `listings.description_tsv` auto-excluded/recomputed. Excluded spatial_ref_sys, schemaversions, and token tables. Dev-side one-time setup: granted rmpdev the session_replication_role param + sequence UPDATEs, and pre-created `_sync_history` in **public** (the rmp DB's search_path puts rmp first, but the repo only existence-checks public). Verified 39/39 tables, counts match prod. Also cleaned 4 stray non-profile files (appsettings*.json, *.deps.json, *.runtimeconfig.json) out of ubu2's profiles/ dir that were being misparsed as a phantom 'Default' profile. Prior: Added all 12 `media.*` tables to profile 11-ACX (prod→dev mirror) for the ACX media catalog — AIM task #1281 (task listed 8; prod had drifted to 12: +face, +file_action, +person, +thumbnail). Fixed two latent PG→PG bugs the first non-null pgvector data exposed: (1) reading a `vector` threw because the try/catch fallback's `GetFieldValue<string>` is unsupported for `vector` — now the source SELECT casts USER-DEFINED columns to `::text` (covers vector + enums uniformly); (2) `media.image_meta.search_vector` is GENERATED ALWAYS STORED and can't be inserted into — generated columns are now auto-excluded (detected via `is_generated='ALWAYS'`) and recomputed on the target. Verified: 55/55 tables, all 12 media counts match prod, vector values md5-identical, search_vector recomputed on dev. Prior: added `DisableTriggersDuringLoad` (session_replication_role='replica') to unstick `core.events` PG→PG mirror sync where self-referential/inbound FKs blocked unique-constraint recovery and orphan deletes — enabled on all 5 PG mirror profiles, granted the GUC parameter to empdev/acxdev on devpgsql; added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*
+*Last Updated (2026-08-06): **Profiles no longer contain passwords (AIM #1821).** All 26 connection strings across 13 profiles now carry `${PLACEHOLDER}` tokens resolved at load time by `SecretResolver` — environment variable first, then a 600 `secrets.env`. Verified 26/26 placeholders, 0 literals, across devlocal, the devshare mirror, ubu2 `/opt/services` and win2. `ConnectionConfig` splits template from resolved value, with `ResolvedConnectionString` marked `[JsonIgnore]` so a resolved secret is structurally unserializable — which is also what makes `ProfileGenerator` safe, since it copies the config verbatim into generated profiles. Two conditions are deliberately FATAL at startup: an unresolved placeholder, and a secrets file with any group/other bit. Both exist because `ConfigurationValidator` only *logs* errors, so without them the service would sit `active` while sending the literal `${NAME}` as a password — the shape of the nine-day empdev outage. **Five credential copies were found and deleted, not three:** the audit that reported 33 files was run with a gitignore-aware `grep` (Claude Code's Bash `grep` is ugrep `--ignore-files`), which reports ZERO credential files in this repo; `find | xargs grep` reported 237. The extra copies were `publish/` (24 at mode 777, world-WRITABLE, mirrored, holding a live `empprod`), `bin/` (195), a `devdocs` summary (mirrored, 664), and 36 files inside `/opt/services/DatabaseSync/publish/` readable by `github-runner`. Two mechanisms created them, both now closed: the csproj copied profiles into publish output (`CopyToPublishDirectory=Never`), and `deploy-ubu2.sh`'s `--exclude='profiles/'` was unanchored so `--delete` skipped nested copies (now `/profiles/`, plus a credential canary that fails the deploy on any credential file outside `profiles/`). New `scripts/deploy-ubu2.sh` replaces the hand-copied deploy and enforces `600 root:root` + proves `github-runner` is denied. No passwords were rotated (deliberate). ⚠ The 3 LMPro SQL Server logins still have **no AIM vault entry** — they now live only in the two `secrets.env` files. Prior: **Added profile 13-FAF-prodpgsql-devpgsql** — the `faf` schema finally has a mirror (29 tables, runs LAST because all 29 have cross-schema FKs into core). Deliberately `DeleteMode: None` on every table: dev holds ~285 dev-only FAF test rows that full parity would destroy. The trade-off is PK collisions instead — the first run already overwrote 4 dev rows (3 carts, 1 refund) because dev's IDs sit inside the range prod hasn't reached. No config avoids both losses; needs a deliberate reconciliation. FK graph contains a real CYCLE (tickets → order_items → resale_listings → tickets), broken at the two nullable edges. Prior: **Profile prefixes are now ZERO-PADDED (01-12)** — both sort sites compare strings, so `"10" < "7"` meant CORE was running FOURTH, after WGO, inverting the documented cross-schema FK order ever since WGO became profile 10. Masked all along by DisableTriggersDuringLoad suppressing the FKs that would have made it loud. Every renamed profile pins `ProfileId` to its old name so `_sync_history` stays continuous (verified: CORE still resolves 5,849 rows back to 2026-03-03, win2's 01-LMP_Main still returns its runs). **Profile drift audited against prod**: 9 missing tables added (5 core, 2 emp, 1 nxs), 3 stale `wgo.curator_*` entries removed — they had MOVED to the core schema, not vanished — and `wgo.trending_chip_counts` rejected because it has no PK (the upsert requires one). **ACX sequence grants fixed**: acxdev had UPDATE on 0 of 8 `media.*` sequences since #1281, so every run logged 42501 and skipped the setval; also learned `ALTER DEFAULT PRIVILEGES FOR ROLE claude` does NOT cover `postgres`-owned objects. **RI audit's first real catch**: 140 orphaned RMP token rows under deleted users — structural, since token tables are Rule-#132-excluded while their parent users table is mirrored; cleaned. Prior in this pass: Closed the blast-radius gap that `DisableTriggersDuringLoad` opened — suppressing RI on the target also unguards the ordinary parity-delete, which silently orphaned `faf` rows (the one schema with no sync profile: 35 FKs into `core`) and destroyed every dev-only test account in mirrored `core.*` tables. Three additions: `AuditReferentialIntegrityAfterSync` (post-run orphan count over `pg_constraint`, flags child tables outside sync scope), `DeleteExclusionFilter` (target-side WHERE exempting dev fixtures from parity deletes; convention is a `+devfixture@` email), and `MaxDeletePercent` (ratio ceiling — the PG delete path previously had NO safety check, unlike the SQL Server path). Deliberately did NOT narrow the `session_replication_role` scope: it is load-bearing on the delete path for `core.events`' self-FK. All three proven with controlled probes, not just observed green. Enabled on all 6 PG mirror profiles. Also fixed a nine-day silent outage: `empdev` was rotated 2026-07-16 (AIM #1517) and the gitignored profile files were never updated, so 7-CORE/8-EMP/9-NXS/10-WGO had failed nightly with 28P01 while `systemctl is-active` still reported healthy. Prior: Added profile 12-RMP-prodpgsql-devpgsql (rmp database, rmp schema, 39 tables, prod→dev mirror, daily 05:00, DisableTriggersDuringLoad) — RMP is now on ubu1 so the long-standing TODO is done. First PostGIS sync: `geography` columns round-trip via the USER-DEFINED `::text` cast (md5-identical), generated `listings.description_tsv` auto-excluded/recomputed. Excluded spatial_ref_sys, schemaversions, and token tables. Dev-side one-time setup: granted rmpdev the session_replication_role param + sequence UPDATEs, and pre-created `_sync_history` in **public** (the rmp DB's search_path puts rmp first, but the repo only existence-checks public). Verified 39/39 tables, counts match prod. Also cleaned 4 stray non-profile files (appsettings*.json, *.deps.json, *.runtimeconfig.json) out of ubu2's profiles/ dir that were being misparsed as a phantom 'Default' profile. Prior: Added all 12 `media.*` tables to profile 11-ACX (prod→dev mirror) for the ACX media catalog — AIM task #1281 (task listed 8; prod had drifted to 12: +face, +file_action, +person, +thumbnail). Fixed two latent PG→PG bugs the first non-null pgvector data exposed: (1) reading a `vector` threw because the try/catch fallback's `GetFieldValue<string>` is unsupported for `vector` — now the source SELECT casts USER-DEFINED columns to `::text` (covers vector + enums uniformly); (2) `media.image_meta.search_vector` is GENERATED ALWAYS STORED and can't be inserted into — generated columns are now auto-excluded (detected via `is_generated='ALWAYS'`) and recomputed on the target. Verified: 55/55 tables, all 12 media counts match prod, vector values md5-identical, search_vector recomputed on dev. Prior: added `DisableTriggersDuringLoad` (session_replication_role='replica') to unstick `core.events` PG→PG mirror sync where self-referential/inbound FKs blocked unique-constraint recovery and orphan deletes — enabled on all 5 PG mirror profiles, granted the GUC parameter to empdev/acxdev on devpgsql; added OVERRIDING SYSTEM VALUE for GENERATED ALWAYS AS IDENTITY support; added ACX profile (11-ACX-prodpgsql-devpgsql); fixed ubu1 UFW firewall blocking ubu2 on port 8282*

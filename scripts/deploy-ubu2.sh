@@ -55,9 +55,15 @@ dotnet publish DatabaseSync.csproj -c Release -p:SourceRevisionId="$COMMIT" \
 
 sudo systemctl stop database-sync
 # --exclude protects live per-host state from being clobbered by build output.
+#
+# The leading slash ANCHORS each pattern to the deploy root, and that is load-bearing. An
+# unanchored 'profiles/' matches a directory of that name at ANY depth, so --delete would skip
+# nested copies like publish/profiles/ and leave them in place forever. That is exactly how 36
+# credential files at mode 775 www-data survived inside $DEPLOY/publish/ — readable by
+# github-runner and nobody — until AIM #1821 found them. Do not remove the slashes.
 sudo rsync -a --delete \
-     --exclude='profiles/' --exclude='profiles.Development/' --exclude='profiles.Production/' \
-     --exclude='secrets.env' --exclude='.database-sync.lock' \
+     --exclude='/profiles/' --exclude='/profiles.Development/' --exclude='/profiles.Production/' \
+     --exclude='/secrets.env' --exclude='/.database-sync.lock' \
      "$BUILD/out/" "$DEPLOY/"
 echo "    deployed commit $COMMIT"
 REMOTE
@@ -96,6 +102,19 @@ if id github-runner &>/dev/null; then
     fi
     echo "    github-runner: access DENIED (verified)"
 fi
+
+# CANARY: nothing outside profiles/ may hold a credential. This is the check that would have
+# caught the 36 files sitting in $DEPLOY/publish/ for months. Run privileged and glob-free -
+# a find that cannot traverse a directory reports nothing and reads as success (AIM #1507).
+STRAY=$(find "$DEPLOY" -type f -not -path "$DEPLOY/profiles/*" -print0 \
+        | xargs -0 grep -l "Password=" 2>/dev/null || true)
+if [[ -n "$STRAY" ]]; then
+    echo "    !! credential-bearing files found OUTSIDE profiles/:"
+    echo "$STRAY" | sed 's|^|       |'
+    echo "    Remove them. A stale copy is worse than none - the next rotation misses it."
+    exit 1
+fi
+echo "    credential canary: no credential files outside profiles/ (verified)"
 REMOTE
 
 echo "==> Starting and verifying"
