@@ -247,12 +247,19 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 source_table AS TableName,
                 MAX(CASE WHEN success THEN sync_end_time END) AS LastSuccessfulSync,
                 MAX(sync_end_time) AS LastSyncAttempt,
-                (SELECT max_source_timestamp 
-                 FROM ""{TableName}"" h2 
+                -- IS NOT NULL is load-bearing: a FullRefresh run records a NULL
+                -- max_source_timestamp, so without this filter the newest successful row
+                -- (which may well be that FullRefresh) hands back NULL and DESTROYS the
+                -- incremental resume point. The next incremental run then logs
+                -- ""No sync history found"" despite a perfectly good watermark sitting a
+                -- row or two below, and falls back to lookback-from-now. AIM #1975.
+                (SELECT max_source_timestamp
+                 FROM ""{TableName}"" h2
                  WHERE h2.profile_name = h.profile_name
-                   AND h2.source_table = h.source_table 
-                   AND h2.success = TRUE 
-                 ORDER BY sync_end_time DESC 
+                   AND h2.source_table = h.source_table
+                   AND h2.success = TRUE
+                   AND h2.max_source_timestamp IS NOT NULL
+                 ORDER BY sync_end_time DESC
                  LIMIT 1) AS MaxSourceTimestamp,
                 (SELECT success 
                  FROM ""{TableName}"" h3 

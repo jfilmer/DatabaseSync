@@ -220,11 +220,17 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                 source_table AS TableName,
                 MAX(CASE WHEN success = 1 THEN sync_end_time END) AS LastSuccessfulSync,
                 MAX(sync_end_time) AS LastSyncAttempt,
+                -- IS NOT NULL is load-bearing: a FullRefresh run records a NULL
+                -- max_source_timestamp, so without this filter the newest successful row
+                -- (often that FullRefresh) hands back NULL and DESTROYS the incremental
+                -- resume point, sending the next incremental run down the
+                -- ""No sync history found"" lookback-from-now path. AIM #1975.
                 (SELECT TOP 1 max_source_timestamp
                  FROM [{TableName}] h2
                  WHERE h2.profile_name = h.profile_name
                    AND h2.source_table = h.source_table
                    AND h2.success = 1
+                   AND h2.max_source_timestamp IS NOT NULL
                  ORDER BY sync_end_time DESC) AS MaxSourceTimestamp,
                 (SELECT TOP 1 success
                  FROM [{TableName}] h3
