@@ -153,6 +153,30 @@ public class PostgreSqlSchemaAnalyzer : ISchemaAnalyzer
         return await connection.ExecuteScalarAsync<long>(sql, commandTimeout: _commandTimeout);
     }
 
+    /// <summary>
+    /// Approximate row count from pg_class.reltuples (maintained by ANALYZE/autovacuum).
+    /// Metadata-only, so it is instant regardless of table size. Returns null when the
+    /// table has never been analyzed (reltuples = -1 on PG 14+, 0 on older versions),
+    /// so the caller leaves behaviour unchanged rather than acting on a bogus zero.
+    /// AIM #1966.
+    /// </summary>
+    public async Task<long?> GetEstimatedRowCountAsync(string tableName)
+    {
+        var formattedTable = FormatTableNameForSql(tableName);
+        var sql = $"SELECT reltuples::bigint FROM pg_class WHERE oid = '{formattedTable}'::regclass";
+
+        try
+        {
+            await using var connection = new NpgsqlConnection(_connectionString);
+            var estimate = await connection.ExecuteScalarAsync<long?>(sql, commandTimeout: _commandTimeout);
+            return estimate is null or < 0 ? null : estimate;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     public async Task<DateTime?> GetMaxTimestampAsync(string tableName, string timestampColumn)
     {
         var formattedTable = FormatTableNameForSql(tableName);

@@ -219,15 +219,33 @@ public class SyncOrchestrator
 
         try
         {
+            // Get the source table name with correct casing for the source database
+            var sourceTableNameForCheck = GetEffectiveSourceTableName(tableConfig);
+
+            // A forced full refresh is all-or-nothing per day-schedule, so without this guard
+            // the Sunday entry flips EVERY table to FullRefresh regardless of size. Decide the
+            // exemption BEFORE the log line below, so the log never reports "(forced)" for a
+            // table that was actually left on its configured Mode. AIM #1966.
+            if (forceFullRefresh && _profile.Options.ForceFullRefreshMaxRows > 0)
+            {
+                var estimatedRows = await _sourceAnalyzer.GetEstimatedRowCountAsync(sourceTableNameForCheck);
+                if (estimatedRows > _profile.Options.ForceFullRefreshMaxRows)
+                {
+                    forceFullRefresh = false;
+                    _logger.LogInformation(
+                        "Not forcing FullRefresh on {Table}: ~{Rows:N0} rows exceeds ForceFullRefreshMaxRows " +
+                        "({Limit:N0}); keeping configured mode {Mode}",
+                        tableConfig.SourceTable, estimatedRows, _profile.Options.ForceFullRefreshMaxRows,
+                        tableConfig.Mode);
+                }
+            }
+
             _logger.LogInformation(
                 "Syncing {Table} from {SourceType} to {TargetType} (Mode: {Mode})",
                 tableConfig.SourceTable,
                 _sourceDatabaseType,
                 _targetDatabaseType,
                 forceFullRefresh ? "FullRefresh (forced)" : tableConfig.Mode.ToString());
-
-            // Get the source table name with correct casing for the source database
-            var sourceTableNameForCheck = GetEffectiveSourceTableName(tableConfig);
 
             // Verify source exists
             if (!await _sourceAnalyzer.TableExistsAsync(sourceTableNameForCheck))

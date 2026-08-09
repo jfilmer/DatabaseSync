@@ -26,6 +26,18 @@ public interface ISchemaAnalyzer
     /// Get the row count for a table
     /// </summary>
     Task<long> GetRowCountAsync(string tableName, string? whereClause = null);
+
+    /// <summary>
+    /// Approximate row count read from catalog metadata, NOT COUNT(*).
+    /// Used to decide whether a table is too large to force a full refresh on
+    /// (see ProfileOptions.ForceFullRefreshMaxRows) — a decision that must not itself
+    /// cost a full scan, since COUNT(*) on the 137M-row tbl_Archive_Track is exactly
+    /// the kind of work the check exists to avoid. Accuracy is irrelevant here: the
+    /// threshold is an order-of-magnitude guard, not an exact bound.
+    /// Returns null when the count cannot be determined, which callers MUST treat as
+    /// "unknown - change nothing", preserving existing behaviour. AIM #1966.
+    /// </summary>
+    Task<long?> GetEstimatedRowCountAsync(string tableName);
     
     /// <summary>
     /// Get the maximum value of a timestamp column

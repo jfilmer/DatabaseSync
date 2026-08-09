@@ -722,6 +722,23 @@ public class ProfileOptions
     public int MaxParallelTables { get; set; } = 4;
 
     /// <summary>
+    /// Row ceiling for a FORCED full refresh (a day-schedule ForceFullRefresh, not a table's
+    /// own Mode). A table whose estimated row count exceeds this keeps its configured Mode
+    /// instead of being flipped to FullRefresh. Set 0 to disable the guard.
+    ///
+    /// Exists because ForceFullRefresh is all-or-nothing per schedule, so the Sunday entry
+    /// flipped EVERY table to FullRefresh — including tbl_Archive_Track at 137M rows, which
+    /// blew the transaction log of tempdb on BOTH SQL Server targets every Sunday for three
+    /// weeks (escalating 0 -> 4 -> 8 errors), burning 1-3 hours per attempt and ending with
+    /// 0 rows synced. Small lookup tables still get their weekly full reconciliation.
+    ///
+    /// Deliberately a row THRESHOLD rather than a per-table opt-out flag: a table that grows
+    /// past the limit is exempted automatically, whereas a hand-maintained flag list rots
+    /// silently — which is the exact drift pattern that let this run unnoticed. AIM #1966.
+    /// </summary>
+    public long ForceFullRefreshMaxRows { get; set; } = 3_000_000;
+
+    /// <summary>
     /// Database command timeout in seconds
     /// </summary>
     public int CommandTimeoutSeconds { get; set; } = 3600;
