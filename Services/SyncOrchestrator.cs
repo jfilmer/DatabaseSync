@@ -337,6 +337,16 @@ public class SyncOrchestrator
             var effectiveMode = forceFullRefresh ? SyncMode.FullRefresh : tableConfig.Mode;
             DateTime? lastSyncTime = tableConfig.LastSyncTimeOverride;
 
+            // Tracks whether lastSyncTime was ALREADY derived by subtracting the lookback, so the
+            // block further down does not subtract it a second time. This used to be inferred from
+            // a timestamp comparison, which cannot work: that branch sets
+            // lastSyncTime = UtcNow - Lookback, and the later guard re-evaluates UtcNow - Lookback
+            // milliseconds afterwards, which is fractionally LARGER - so the comparison was always
+            // true and the lookback was applied TWICE. Measured: 2160h -> 180 days, 168h -> 336h.
+            // Provenance is a fact about how the value was produced, so track it, don't re-derive
+            // it from the value. AIM #1975.
+            var lookbackAlreadyApplied = false;
+
             // SQL Server minimum date (DateTime.MinValue is 1/1/0001 which causes overflow)
             var sqlMinDate = new DateTime(1753, 1, 1);
 
@@ -357,6 +367,7 @@ public class SyncOrchestrator
                 {
                     // No history exists - use lookback hours from now for first sync
                     lastSyncTime = DateTime.UtcNow.AddHours(-tableConfig.LookbackHours);
+                    lookbackAlreadyApplied = true;
                     _logger.LogInformation("No sync history found - using lookback of {Hours}h from now: {Time}",
                         tableConfig.LookbackHours, lastSyncTime);
                 }
@@ -369,13 +380,22 @@ public class SyncOrchestrator
             }
 
             // Apply lookback hours if configured and we have history (re-sync data from further back to catch late changes)
+            //
+            // NOTE ON SCOPE (AIM #1975): the final condition means this only fires when the
+            // watermark is ALREADY older than the lookback window - i.e. a first sync or after a
+            // gap - NOT on every incremental run. That is a real divergence from how CLAUDE.md
+            // used to describe LookbackHours, and it was left AS-IS deliberately: measured
+            // 2026-08-09, zero rows had been missed because of it (0 missing and 0 stale across
+            // 6 PG tables, and 0 across a 54,355-row LMPro slice), while making it fire every run
+            // would re-sync 5,323,656 rows PER DAY on tbl_Archive_Track alone, which currently
+            // syncs 0. The docs were corrected to match the code rather than the reverse.
             if (effectiveMode == SyncMode.Incremental &&
                 tableConfig.LookbackHours > 0 &&
+                !lookbackAlreadyApplied &&
                 lastSyncTime.HasValue &&
                 lastSyncTime.Value > sqlMinDate &&
                 lastSyncTime.Value < DateTime.UtcNow.AddHours(-tableConfig.LookbackHours))
             {
-                // Only apply lookback if lastSyncTime came from history (not already calculated from lookback)
                 var originalTime = lastSyncTime.Value;
                 lastSyncTime = lastSyncTime.Value.AddHours(-tableConfig.LookbackHours);
 
