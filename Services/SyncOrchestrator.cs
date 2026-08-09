@@ -712,6 +712,16 @@ public class SyncOrchestrator
                             {
                                 existingResult.RowsDeleted = deletedCount;
                             }
+
+                            // The in-memory update above is what the run summary and dashboard read,
+                            // which is why THEY were always right. The history row was written back in
+                            // phase 1 with deletes skipped, so without this it stays 0 forever - it was
+                            // 0 across all 25,372 rows of every PG mirror profile. AIM #1964.
+                            if (_historyRepository != null)
+                            {
+                                await _historyRepository.UpdateDeleteCountAsync(
+                                    _runId, tableConfig.SourceTable, deletedCount);
+                            }
                         }
                     }
                     catch (Exception ex)
