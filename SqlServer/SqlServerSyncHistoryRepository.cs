@@ -15,6 +15,14 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
     private readonly ILogger<SqlServerSyncHistoryRepository> _logger;
     private const string TableName = "_sync_history";
 
+    /// <summary>
+    /// Whether the target's _sync_history carries the 'skipped' column (AIM #1946).
+    /// Probed during InitializeAsync rather than assumed, so an ADD COLUMN denied by a
+    /// restricted sync user cannot take down ALL history recording with an invalid-column
+    /// error - the INSERT adapts to what is actually there.
+    /// </summary>
+    private bool _hasSkippedColumn = true;
+
     public SqlServerSyncHistoryRepository(
         string connectionString,
         ILogger<SqlServerSyncHistoryRepository> logger)
@@ -37,6 +45,7 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                     sync_start_time DATETIME2 NOT NULL,
                     sync_end_time DATETIME2 NOT NULL,
                     success BIT NOT NULL,
+                    skipped BIT NOT NULL DEFAULT 0,
                     rows_processed BIGINT NOT NULL DEFAULT 0,
                     rows_inserted BIGINT NOT NULL DEFAULT 0,
                     rows_updated BIGINT NOT NULL DEFAULT 0,
@@ -79,26 +88,61 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
             END
         ";
 
+        const string addSkippedColumnSql = $@"
+            IF NOT EXISTS (
+                SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = '{TableName}' AND COLUMN_NAME = 'skipped'
+            )
+            BEGIN
+                ALTER TABLE [{TableName}] ADD skipped BIT NOT NULL DEFAULT 0;
+            END
+        ";
+
+        const string checkSkippedColumnSql = $@"
+            SELECT COUNT(1) FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = '{TableName}' AND COLUMN_NAME = 'skipped'";
+
         await using var connection = new SqlConnection(_connectionString);
         await connection.ExecuteAsync(createTableSql);
         await connection.ExecuteAsync(addRecentRowsColumnSql);
         await connection.ExecuteAsync(addTotalSourceRowsColumnSql);
+
+        try
+        {
+            await connection.ExecuteAsync(addSkippedColumnSql);
+        }
+        catch (SqlException ex)
+        {
+            _logger.LogDebug(ex, "Cannot add 'skipped' column to sync history table - continuing without it.");
+        }
+
+        // Probe rather than assume - see _hasSkippedColumn.
+        _hasSkippedColumn = await connection.ExecuteScalarAsync<int>(checkSkippedColumnSql) > 0;
+        if (!_hasSkippedColumn)
+        {
+            _logger.LogWarning(
+                "_sync_history has no 'skipped' column - skipped tables will be recorded as success=1 " +
+                "and will be indistinguishable from real successes. Add it with a privileged user: " +
+                "ALTER TABLE [_sync_history] ADD skipped BIT NOT NULL DEFAULT 0;");
+        }
 
         _logger.LogDebug("Sync history table initialized");
     }
 
     public async Task RecordSyncAsync(SyncHistory history)
     {
-        const string sql = $@"
+        var sql = $@"
             INSERT INTO [{TableName}] (
                 run_id, profile_name, source_table, target_table,
                 sync_start_time, sync_end_time, success,
+                {(_hasSkippedColumn ? "skipped," : "")}
                 rows_processed, rows_inserted, rows_updated, rows_deleted,
                 error_message, max_source_timestamp, duration_seconds,
                 recent_rows_count, total_source_rows
             ) VALUES (
                 @RunId, @ProfileName, @SourceTable, @TargetTable,
                 @SyncStartTime, @SyncEndTime, @Success,
+                {(_hasSkippedColumn ? "@Skipped," : "")}
                 @RowsProcessed, @RowsInserted, @RowsUpdated, @RowsDeleted,
                 @ErrorMessage, @MaxSourceTimestamp, @DurationSeconds,
                 @RecentRowsCount, @TotalSourceRows
@@ -114,6 +158,7 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
             history.SyncStartTime,
             history.SyncEndTime,
             history.Success,
+            history.Skipped,
             history.RowsProcessed,
             history.RowsInserted,
             history.RowsUpdated,
@@ -129,12 +174,12 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
             "Recorded sync history for {Profile}/{Table}: {Success}",
             history.ProfileName,
             history.SourceTable,
-            history.Success ? "SUCCESS" : "FAILED");
+            history.Skipped ? "SKIPPED" : history.Success ? "SUCCESS" : "FAILED");
     }
 
     public async Task<LastSyncInfo?> GetLastSyncInfoAsync(string profileName, string sourceTable)
     {
-        const string sql = $@"
+        var sql = $@"
             SELECT
                 profile_name AS ProfileName,
                 source_table AS TableName,
@@ -174,6 +219,7 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                 sync_start_time AS SyncStartTime,
                 sync_end_time AS SyncEndTime,
                 success AS Success,
+                {(_hasSkippedColumn ? "skipped" : "CAST(0 AS BIT)")} AS Skipped,
                 rows_processed AS RowsProcessed,
                 rows_inserted AS RowsInserted,
                 rows_updated AS RowsUpdated,
@@ -196,7 +242,7 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
 
     public async Task<Dictionary<string, LastSyncInfo>> GetAllLastSyncInfoAsync(string profileName)
     {
-        const string sql = $@"
+        var sql = $@"
             WITH RankedHistory AS (
                 SELECT
                     profile_name,
@@ -237,6 +283,7 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
                 sync_start_time AS SyncStartTime,
                 sync_end_time AS SyncEndTime,
                 success AS Success,
+                {(_hasSkippedColumn ? "skipped" : "CAST(0 AS BIT)")} AS Skipped,
                 rows_processed AS RowsProcessed,
                 rows_inserted AS RowsInserted,
                 rows_updated AS RowsUpdated,

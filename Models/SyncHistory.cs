@@ -44,6 +44,15 @@ public class SyncHistory
     /// Whether the sync was successful
     /// </summary>
     public bool Success { get; set; }
+
+    /// <summary>
+    /// Whether the table was skipped (source or target table missing).
+    /// A skipped table is recorded with Success = true so it does not count as a failure,
+    /// which means Success ALONE OVERSTATES what happened - history would read as
+    /// "everything synced" while the run summary correctly said "38/39, 1 skipped".
+    /// Always filter on this when using _sync_history as a freshness check. AIM #1946.
+    /// </summary>
+    public bool Skipped { get; set; }
     
     /// <summary>
     /// Number of rows processed

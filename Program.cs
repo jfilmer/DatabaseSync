@@ -37,12 +37,35 @@ var earlyConfig = new ConfigurationBuilder()
     .SetBasePath(basePath)
     .AddJsonFile("appsettings.json", optional: true, reloadOnChange: false)
     .AddJsonFile($"appsettings.{environment}.json", optional: true, reloadOnChange: false)
+    .AddEnvironmentVariables()
     .Build();
 
 var syncServiceConfig = earlyConfig.GetSection("SyncService").Get<SyncServiceConfig>() ?? new SyncServiceConfig();
 
 // Determine log path - if relative, make it relative to basePath
 var configuredLogPath = syncServiceConfig.LogPath ?? "logs";
+
+// A drive-qualified Windows path is meaningless on a non-Windows host: Path.IsPathRooted
+// returns FALSE for "D:/Logs/DatabaseSync" on Linux, so it gets joined onto basePath and
+// Serilog silently creates a directory literally named "D:" under the app root. That is
+// exactly what happened on ubu2 - logs landed in /opt/services/DatabaseSync/D:/Logs/... while
+// the documented /var/log/services/DatabaseSync sat five months stale, so anyone following the
+// runbook during an incident read the wrong file and concluded the service had not run.
+// appsettings.json must keep the Windows path (win2 needs it) and an
+// appsettings.Production.json override cannot help because BOTH hosts run as Production,
+// so fall back here instead. Override with SyncService__LogPath if a host wants a different
+// directory. AIM #1946.
+if (!OperatingSystem.IsWindows()
+    && configuredLogPath.Length >= 2
+    && char.IsLetter(configuredLogPath[0])
+    && configuredLogPath[1] == ':')
+{
+    const string nonWindowsFallback = "/var/log/services/DatabaseSync";
+    Console.WriteLine(
+        $"  LogPath '{configuredLogPath}' is a Windows drive path and cannot be used on this OS; " +
+        $"falling back to '{nonWindowsFallback}'");
+    configuredLogPath = nonWindowsFallback;
+}
 var logDirectory = Path.IsPathRooted(configuredLogPath)
     ? configuredLogPath
     : Path.Combine(basePath, configuredLogPath);
@@ -603,6 +626,7 @@ static string GenerateDashboardHtml(
         tr:hover { background: #1f1f3a; }
         .success { color: #28a745; }
         .failed { color: #dc3545; }
+        .skipped { color: #9aa5b1; }
         .number { text-align: right; font-family: monospace; }
         .timestamp { color: #888; font-size: 0.85em; }
         .view-link { color: #00d9ff; text-decoration: none; }
@@ -791,7 +815,13 @@ static string GenerateDashboardHtml(
         var totalInserts = last24h.Sum(h => h.RowsInserted);
         var totalUpdates = last24h.Sum(h => h.RowsUpdated);
         var totalDeletes = last24h.Sum(h => h.RowsDeleted);
-        var successRate = last24h.Any() ? (last24h.Count(h => h.Success) * 100.0 / last24h.Count) : 0;
+        // Skipped tables are recorded with Success = true (they are not failures), so counting
+        // them here would inflate the rate with tables that did nothing. Exclude them from both
+        // sides of the ratio rather than scoring them either way. AIM #1946.
+        var last24hAttempted = last24h.Where(h => !h.Skipped).ToList();
+        var successRate = last24hAttempted.Any()
+            ? (last24hAttempted.Count(h => h.Success) * 100.0 / last24hAttempted.Count)
+            : 0;
 
         // Determine status - check if profile has ever run (LastRunTime != null)
         var hasNeverRun = !profile.LastRunTime.HasValue;
@@ -939,7 +969,7 @@ static string GenerateDashboardHtml(
 
             foreach (var h in recentHistory)
             {
-                var rowClass = h.Success ? "success" : "failed";
+                var rowClass = h.Skipped ? "skipped" : h.Success ? "success" : "failed";
                 // Calculate Recent % based on RowsUpdated (not RowsProcessed which includes inserts)
                 // This answers: "Of the updates we performed, what % were for recent records?"
                 var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsUpdated);
@@ -949,7 +979,7 @@ static string GenerateDashboardHtml(
                     <tr>
                         <td class=""timestamp"">{h.SyncEndTime.ToLocalTime():MM-dd HH:mm}</td>
                         <td>{System.Web.HttpUtility.HtmlEncode(h.SourceTable)}</td>
-                        <td class=""{rowClass}"">{(h.Success ? "OK" : "FAIL")}</td>
+                        <td class=""{rowClass}"">{(h.Skipped ? "SKIP" : h.Success ? "OK" : "FAIL")}</td>
                         <td class=""number"">{h.RowsProcessed:N0}</td>
                         <td class=""number"">{h.RowsInserted:N0}</td>
                         <td class=""number"">{h.RowsUpdated:N0}</td>
@@ -1025,6 +1055,7 @@ static string GenerateProfileDashboardHtml(
         tr:hover {{ background: #1f1f3a; }}
         .success {{ color: #28a745; }}
         .failed {{ color: #dc3545; }}
+        .skipped {{ color: #9aa5b1; }}
         .number {{ text-align: right; font-family: monospace; }}
         .timestamp {{ color: #888; font-size: 0.85em; }}
         .error-msg {{ color: #dc3545; font-size: 0.85em; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
@@ -1284,10 +1315,12 @@ static string GenerateProfileDashboardHtml(
 
     foreach (var h in history.Take(50))
     {
-        var rowClass = h.Success ? "success" : "failed";
+        var rowClass = h.Skipped ? "skipped" : h.Success ? "success" : "failed";
         var histSeqFailed = h.ErrorMessage?.Contains("[SEQ_RESET_FAILED]") == true;
         var histSeqBadge = histSeqFailed ? @"<span class=""seq-badge"" title=""Sequence reset failed"">Seq</span>" : "";
-        var histStatusDisplay = h.Success ? $"OK{(histSeqFailed ? $" {histSeqBadge}" : "")}" : "FAIL";
+        var histStatusDisplay = h.Skipped
+            ? "SKIP"
+            : h.Success ? $"OK{(histSeqFailed ? $" {histSeqBadge}" : "")}" : "FAIL";
         // Calculate Recent % based on RowsUpdated (not RowsProcessed which includes inserts)
         // This answers: "Of the updates we performed, what % were for recent records?"
         var effectiveRecentRows = Math.Min(h.RecentRowsCount, h.RowsUpdated);

@@ -15,6 +15,16 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
     private readonly ILogger<PostgreSqlSyncHistoryRepository> _logger;
     private const string TableName = "_sync_history";
 
+    /// <summary>
+    /// Whether the target's _sync_history carries the 'skipped' column (AIM #1946).
+    /// Probed during InitializeAsync rather than assumed: the table is frequently pre-created
+    /// by an admin user while the sync user holds DML-only rights, so the ADD COLUMN below can
+    /// be denied (42501). Writing an INSERT that names a column the table does not have would
+    /// fail with 42703 and take down ALL history recording - far worse than the bug being
+    /// fixed - so the INSERT adapts to what is actually there.
+    /// </summary>
+    private bool _hasSkippedColumn = true;
+
     public PostgreSqlSyncHistoryRepository(
         string connectionString, 
         ILogger<PostgreSqlSyncHistoryRepository> logger)
@@ -39,6 +49,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 sync_start_time TIMESTAMP NOT NULL,
                 sync_end_time TIMESTAMP NOT NULL,
                 success BOOLEAN NOT NULL,
+                skipped BOOLEAN NOT NULL DEFAULT FALSE,
                 rows_processed BIGINT NOT NULL DEFAULT 0,
                 rows_inserted BIGINT NOT NULL DEFAULT 0,
                 rows_updated BIGINT NOT NULL DEFAULT 0,
@@ -84,6 +95,22 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
             END $$;
         ";
 
+        const string addSkippedColumnSql = $@"
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = '{TableName}' AND column_name = 'skipped'
+                ) THEN
+                    ALTER TABLE ""{TableName}"" ADD COLUMN skipped BOOLEAN NOT NULL DEFAULT FALSE;
+                END IF;
+            END $$;
+        ";
+
+        const string checkSkippedColumnSql = $@"
+            SELECT COUNT(1) FROM information_schema.columns
+            WHERE table_name = '{TableName}' AND column_name = 'skipped'";
+
         await using var connection = new NpgsqlConnection(_connectionString);
 
         // Check if table exists first - skip CREATE if it does (for users without CREATE permission)
@@ -111,6 +138,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
             {
                 await connection.ExecuteAsync(addRecentRowsColumnSql);
                 await connection.ExecuteAsync(addTotalSourceRowsColumnSql);
+                await connection.ExecuteAsync(addSkippedColumnSql);
             }
             catch (PostgresException ex) when (ex.SqlState == "42501")
             {
@@ -118,21 +146,33 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
             }
         }
 
+        // Probe rather than assume - see _hasSkippedColumn.
+        _hasSkippedColumn = await connection.ExecuteScalarAsync<int>(checkSkippedColumnSql) > 0;
+        if (!_hasSkippedColumn)
+        {
+            _logger.LogWarning(
+                "_sync_history has no 'skipped' column - skipped tables will be recorded as success=true " +
+                "and will be indistinguishable from real successes. Add it with a privileged user: " +
+                "ALTER TABLE \"_sync_history\" ADD COLUMN skipped BOOLEAN NOT NULL DEFAULT FALSE;");
+        }
+
         _logger.LogDebug("Sync history table initialized");
     }
 
     public async Task RecordSyncAsync(SyncHistory history)
     {
-        const string sql = $@"
+        var sql = $@"
             INSERT INTO ""{TableName}"" (
                 run_id, profile_name, source_table, target_table,
                 sync_start_time, sync_end_time, success,
+                {(_hasSkippedColumn ? "skipped," : "")}
                 rows_processed, rows_inserted, rows_updated, rows_deleted,
                 error_message, max_source_timestamp, duration_seconds,
                 recent_rows_count, total_source_rows
             ) VALUES (
                 @RunId, @ProfileName, @SourceTable, @TargetTable,
                 @SyncStartTime, @SyncEndTime, @Success,
+                {(_hasSkippedColumn ? "@Skipped," : "")}
                 @RowsProcessed, @RowsInserted, @RowsUpdated, @RowsDeleted,
                 @ErrorMessage, @MaxSourceTimestamp, @DurationSeconds,
                 @RecentRowsCount, @TotalSourceRows
@@ -148,6 +188,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
             history.SyncStartTime,
             history.SyncEndTime,
             history.Success,
+            history.Skipped,
             history.RowsProcessed,
             history.RowsInserted,
             history.RowsUpdated,
@@ -160,10 +201,10 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
         });
 
         _logger.LogDebug(
-            "Recorded sync history for {Profile}/{Table}: {Success}", 
+            "Recorded sync history for {Profile}/{Table}: {Success}",
             history.ProfileName,
-            history.SourceTable, 
-            history.Success ? "SUCCESS" : "FAILED");
+            history.SourceTable,
+            history.Skipped ? "SKIPPED" : history.Success ? "SUCCESS" : "FAILED");
     }
 
     public async Task<LastSyncInfo?> GetLastSyncInfoAsync(string profileName, string sourceTable)
@@ -200,7 +241,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
 
     public async Task<List<SyncHistory>> GetSyncHistoryAsync(string profileName, string sourceTable, int limit = 10)
     {
-        const string sql = $@"
+        var sql = $@"
             SELECT
                 id AS Id,
                 run_id AS RunId,
@@ -210,6 +251,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 sync_start_time AS SyncStartTime,
                 sync_end_time AS SyncEndTime,
                 success AS Success,
+                {(_hasSkippedColumn ? "skipped" : "FALSE")} AS Skipped,
                 rows_processed AS RowsProcessed,
                 rows_inserted AS RowsInserted,
                 rows_updated AS RowsUpdated,
@@ -253,7 +295,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
 
     public async Task<List<SyncHistory>> GetRecentHistoryAsync(string profileName, int limit = 50)
     {
-        const string sql = $@"
+        var sql = $@"
             SELECT
                 id AS Id,
                 run_id AS RunId,
@@ -263,6 +305,7 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
                 sync_start_time AS SyncStartTime,
                 sync_end_time AS SyncEndTime,
                 success AS Success,
+                {(_hasSkippedColumn ? "skipped" : "FALSE")} AS Skipped,
                 rows_processed AS RowsProcessed,
                 rows_inserted AS RowsInserted,
                 rows_updated AS RowsUpdated,

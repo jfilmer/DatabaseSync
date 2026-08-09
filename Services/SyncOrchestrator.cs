@@ -471,6 +471,7 @@ public class SyncOrchestrator
                 SyncStartTime = syncStartTime,
                 SyncEndTime = DateTime.UtcNow,
                 Success = result.Success,
+                Skipped = result.Skipped,
                 RowsProcessed = result.RowsProcessed,
                 RowsInserted = result.RowsInserted,
                 RowsUpdated = result.RowsUpdated,
