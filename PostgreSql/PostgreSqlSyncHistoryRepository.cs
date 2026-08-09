@@ -207,6 +207,38 @@ public class PostgreSqlSyncHistoryRepository : ISyncHistoryRepository
             history.Skipped ? "SKIPPED" : history.Success ? "SUCCESS" : "FAILED");
     }
 
+    /// <summary>
+    /// Back-fill rows_deleted onto the phase-1 history row. See ISyncHistoryRepository. AIM #1964.
+    /// </summary>
+    public async Task UpdateDeleteCountAsync(Guid runId, string sourceTable, long rowsDeleted)
+    {
+        const string sql = $@"
+            UPDATE ""{TableName}""
+            SET rows_deleted = @rowsDeleted
+            WHERE run_id = @runId AND source_table = @sourceTable";
+
+        try
+        {
+            await using var connection = new NpgsqlConnection(_connectionString);
+            var updated = await connection.ExecuteAsync(sql, new { runId, sourceTable, rowsDeleted });
+
+            if (updated == 0)
+            {
+                _logger.LogWarning(
+                    "No history row to annotate with {Rows:N0} deletes for {Table} (run {RunId}) - " +
+                    "the delete count is correct in the run summary but absent from _sync_history",
+                    rowsDeleted, sourceTable, runId);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Never fail a sync that already moved data just because history could not be annotated.
+            _logger.LogWarning(ex,
+                "Failed to record {Rows:N0} deletes for {Table} in sync history",
+                rowsDeleted, sourceTable);
+        }
+    }
+
     public async Task<LastSyncInfo?> GetLastSyncInfoAsync(string profileName, string sourceTable)
     {
         const string sql = $@"

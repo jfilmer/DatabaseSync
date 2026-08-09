@@ -177,6 +177,41 @@ public class SqlServerSyncHistoryRepository : ISyncHistoryRepository
             history.Skipped ? "SKIPPED" : history.Success ? "SUCCESS" : "FAILED");
     }
 
+    /// <summary>
+    /// Back-fill rows_deleted onto an existing history row. See ISyncHistoryRepository.
+    /// In practice a no-op on this path: SQL Server targets delete INLINE within each
+    /// table's sync, so the history row is already written with the correct count
+    /// (measured: max rows_deleted = 3,775,721 on the LMPro targets, vs 0 across all
+    /// 25,372 PG mirror rows). Implemented for interface parity and so a future
+    /// two-phase SQL Server path would be covered. AIM #1964.
+    /// </summary>
+    public async Task UpdateDeleteCountAsync(Guid runId, string sourceTable, long rowsDeleted)
+    {
+        const string sql = $@"
+            UPDATE [{TableName}]
+            SET rows_deleted = @rowsDeleted
+            WHERE run_id = @runId AND source_table = @sourceTable";
+
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            var updated = await connection.ExecuteAsync(sql, new { runId, sourceTable, rowsDeleted });
+
+            if (updated == 0)
+            {
+                _logger.LogWarning(
+                    "No history row to annotate with {Rows:N0} deletes for {Table} (run {RunId})",
+                    rowsDeleted, sourceTable, runId);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Failed to record {Rows:N0} deletes for {Table} in sync history",
+                rowsDeleted, sourceTable);
+        }
+    }
+
     public async Task<LastSyncInfo?> GetLastSyncInfoAsync(string profileName, string sourceTable)
     {
         var sql = $@"

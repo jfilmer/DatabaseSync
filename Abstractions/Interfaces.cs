@@ -70,6 +70,22 @@ public interface ISyncHistoryRepository
     /// Record a sync operation
     /// </summary>
     Task RecordSyncAsync(SyncHistory history);
+
+    /// <summary>
+    /// Back-fill the delete count onto an already-written history row, keyed on
+    /// (run_id, source_table) which is unique within a run.
+    ///
+    /// Needed because PG→PG two-phase sync writes the history row at the end of PHASE 1,
+    /// with deletes deliberately skipped, and then performs the deletes in PHASE 2 — which
+    /// previously only updated the in-memory SyncResult. That is why the run summary was
+    /// right while _sync_history.rows_deleted read 0 on every row of every PG mirror
+    /// profile (25,372 rows measured). The SQL Server path deletes inline, so its row is
+    /// already correct and this is simply a no-op there.
+    ///
+    /// MUST NOT throw: a failure to annotate history is never a reason to fail a sync that
+    /// already moved data. Implementations swallow and log. AIM #1964.
+    /// </summary>
+    Task UpdateDeleteCountAsync(Guid runId, string sourceTable, long rowsDeleted);
     
     /// <summary>
     /// Get the last successful sync info for a table
