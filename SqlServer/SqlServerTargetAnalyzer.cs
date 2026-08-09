@@ -110,6 +110,31 @@ public class SqlServerTargetAnalyzer : ISchemaAnalyzer
         return await connection.ExecuteScalarAsync<long>(sql, commandTimeout: _commandTimeout);
     }
 
+    /// <summary>
+    /// Approximate row count from sys.partitions. See ISchemaAnalyzer. AIM #1966.
+    /// Only the SOURCE analyzer drives the ForceFullRefreshMaxRows decision, but the
+    /// method is on the shared interface so the target analyzer implements it too.
+    /// </summary>
+    public async Task<long?> GetEstimatedRowCountAsync(string tableName)
+    {
+        const string sql = @"
+            SELECT SUM(p.rows)
+            FROM sys.partitions p
+            WHERE p.object_id = OBJECT_ID(@tableName)
+              AND p.index_id IN (0, 1)";
+
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            return await connection.ExecuteScalarAsync<long?>(
+                sql, new { tableName }, commandTimeout: _commandTimeout);
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     public async Task<DateTime?> GetMaxTimestampAsync(string tableName, string timestampColumn)
     {
         var sql = $"SELECT MAX([{timestampColumn}]) FROM [{tableName}]";

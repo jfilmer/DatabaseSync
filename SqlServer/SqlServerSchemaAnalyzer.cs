@@ -109,6 +109,32 @@ public class SqlServerSchemaAnalyzer : ISchemaAnalyzer
         return await connection.ExecuteScalarAsync<long>(sql, commandTimeout: _commandTimeout);
     }
 
+    /// <summary>
+    /// Approximate row count from sys.partitions (index_id 0 = heap, 1 = clustered).
+    /// Metadata-only, so it is instant even on a 137M-row table. AIM #1966.
+    /// </summary>
+    public async Task<long?> GetEstimatedRowCountAsync(string tableName)
+    {
+        // Accept both "table" and "schema.table"; OBJECT_ID resolves either form.
+        const string sql = @"
+            SELECT SUM(p.rows)
+            FROM sys.partitions p
+            WHERE p.object_id = OBJECT_ID(@tableName)
+              AND p.index_id IN (0, 1)";
+
+        try
+        {
+            await using var connection = new SqlConnection(_connectionString);
+            return await connection.ExecuteScalarAsync<long?>(
+                sql, new { tableName }, commandTimeout: _commandTimeout);
+        }
+        catch (Exception)
+        {
+            // Unknown - the caller leaves behaviour unchanged rather than guessing.
+            return null;
+        }
+    }
+
     public async Task<DateTime?> GetMaxTimestampAsync(string tableName, string timestampColumn)
     {
         var sql = $"SELECT MAX([{timestampColumn}]) FROM [{tableName}]";
