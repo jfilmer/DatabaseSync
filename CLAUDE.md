@@ -134,6 +134,14 @@ sudo systemctl start database-sync
 
 ### Remote Deployment via SSH (win2)
 
+> ✅ **Use `./scripts/deploy-win2.sh`.** It builds on ubu2 (rule #123), **refuses to stop the service while a sync is running** (and treats an unreachable host as BUSY, never as safe), backs up **binaries only — never `secrets.env`**, copies flat files only, then verifies the profile set and runs a **credential canary that fails the deploy**. `--canary` runs the canary alone.
+>
+> 🔴 **It exists because hand-running this deploy caused two real problems (2026-08-10).** (1) The ad-hoc `Copy-Item -Recurse` backup **duplicated `secrets.env`** every time — two extra copies of three live LMPro credentials in a single day. (2) A canary over the whole tree found **90 LITERAL credentials in 57 files** that #1821 never saw, because that audit only ever checked the *active* `profiles/` directory: `profiles-backup-20260725/` (12, pre-rename), `profiles.Development/` (4, PG profiles that should never have been on win2 at all) and `publish/` (74 — the *same* stale-publish-output mechanism #1821 closed on ubu2 but never cleaned here). All removed; the canary now fails the deploy if any return.
+>
+> **Every Windows-side step is written to a `.ps1`, copied over and executed** rather than inlined into `ssh "… powershell -Command \"…\""`. That quoting is a minefield — during #1975 an inline form silently produced an *empty* result that compared equal to another empty result and read as a **PASS**. Do not "simplify" it back to one-liners.
+>
+> The manual steps below are kept for reference and for debugging the script.
+
 Build locally, deploy remotely. The `claude` user on win2 has admin privileges for service management.
 
 ```bash
@@ -1329,6 +1337,8 @@ find . -path ./.git -prune -o -type f -print0 | xargs -0 grep -l "Password=" 2>/
 grep -ohE 'Password=[^;"]*' profiles/*.json \
   | sed -E 's/Password=\$\{[A-Za-z0-9_]+\}/PLACEHOLDER/; t; s/Password=.*/LITERAL/' | sort | uniq -c
 ```
+
+> 🔴 **CORRECTION 2026-08-10 — the "verified across … and win2" claim below was FALSE for win2.** #1821 checked only win2's *active* `profiles/` directory. A canary over the whole of `C:\Services` found **90 literal credentials in 57 files**, in three trees nobody thought to look at: `profiles-backup-20260725/` (12 — pre-zero-padding profiles, so pre-placeholder), `profiles.Development/` (4 — **PostgreSQL** profiles on the SQL-Server-only host) and `publish/` (74 — the same stale-publish-output mechanism closed on ubu2, never cleaned here). Removed 2026-08-10, and `scripts/deploy-win2.sh --canary` now checks the whole tree and fails the deploy. **These were never rotated** (#1821 deliberately rotated nothing), so treat them as having been live throughout. The lesson is the same one this section already teaches, one level up: *an audit finds only what it thinks to look for* — five copies became eight once someone swept a directory rather than a file list.
 
 **Five copies existed, and each prior audit found only the ones it thought to look for:**
 
